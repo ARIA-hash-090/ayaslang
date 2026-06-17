@@ -39,5 +39,6 @@ class TokenType(Enum):
     RPAREN       = ")"
     COMMA        = ","
     COLON        = ":"
+    DOT          = "."
     NEWLINE      = "NEWLINE"
     EOF          = "EOF"

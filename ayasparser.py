@@ -113,6 +113,36 @@ class GiveBackNode:
         return f"GiveBack({self.value})"
 
 
+class ThingNode:
+    """A struct definition: `thing Point { x: float y: float z: float }`.
+    fields/field_types are parallel lists, like FunNode's params/param_types,
+    but every field MUST have a type annotation (there's no value yet to
+    infer from — a thing definition just describes a shape)."""
+    def __init__(self, name, fields, field_types):
+        self.name        = name
+        self.fields      = fields
+        self.field_types = field_types
+    def __repr__(self):
+        return f"Thing({self.name}, {self.fields})"
+
+class FieldAccessNode:
+    """Reading a field off a struct instance: `enemy.x`."""
+    def __init__(self, name, field):
+        self.name  = name
+        self.field = field
+    def __repr__(self):
+        return f"FieldAccess({self.name}.{self.field})"
+
+class FieldAssignNode:
+    """Writing a field on a struct instance: `enemy.x be 20.0`."""
+    def __init__(self, name, field, value):
+        self.name  = name
+        self.field = field
+        self.value = value
+    def __repr__(self):
+        return f"FieldAssign({self.name}.{self.field} = {self.value})"
+
+
 class Parser:
     def __init__(self, tokens):
         self.tokens = tokens
@@ -154,8 +184,12 @@ class Parser:
 
     def parse_statement(self):
         token = self.current()
-        if token.type == TokenType.LET:
+        if token.type == TokenType.THING:
+            return self.parse_thing()
+        elif token.type == TokenType.LET:
             return self.parse_let()
+        elif token.type == TokenType.IDENTIFIER and self.peek() and self.peek().type == TokenType.DOT:
+            return self.parse_field_assign()
         elif token.type == TokenType.IDENTIFIER and self.peek() and self.peek().type == TokenType.BE:
             return self.parse_assign()
         elif token.type == TokenType.IDENTIFIER and self.peek() and self.peek().type == TokenType.LPAREN:
@@ -173,6 +207,41 @@ class Parser:
             return self.parse_give_back()
         else:
             raise Exception(f"Unexpected token {token.type} on line {token.line}")
+
+    def parse_thing(self):
+        """thing Point {
+               x: float
+               y: float
+           }
+        Every field needs a `: type` annotation — unlike function params,
+        there's no value to infer a type from at definition time."""
+        self.expect(TokenType.THING)
+        name = self.expect(TokenType.IDENTIFIER).value
+        self.skip_newlines()
+        self.expect(TokenType.LBRACE)
+        self.skip_newlines()
+
+        fields      = []
+        field_types = []
+        while self.current().type != TokenType.RBRACE:
+            fname = self.expect(TokenType.IDENTIFIER).value
+            self.expect(TokenType.COLON)
+            ftype = self.expect(TokenType.IDENTIFIER).value
+            fields.append(fname)
+            field_types.append(ftype)
+            self.skip_newlines()
+
+        self.expect(TokenType.RBRACE)
+        return ThingNode(name, fields, field_types)
+
+    def parse_field_assign(self):
+        """enemy.x be 20.0"""
+        name = self.expect(TokenType.IDENTIFIER).value
+        self.expect(TokenType.DOT)
+        field = self.expect(TokenType.IDENTIFIER).value
+        self.expect(TokenType.BE)
+        value = self.parse_expression()
+        return FieldAssignNode(name, field, value)
 
     def parse_let(self):
         self.expect(TokenType.LET)
@@ -356,6 +425,10 @@ class Parser:
             self.advance()
             if self.current().type == TokenType.LPAREN:
                 return self.parse_call(token.value)
+            if self.current().type == TokenType.DOT:
+                self.advance()
+                field = self.expect(TokenType.IDENTIFIER).value
+                return FieldAccessNode(token.value, field)
             return IdentifierNode(token.value)
         else:
             raise Exception(f"Unexpected token {token.type} on line {token.line}")

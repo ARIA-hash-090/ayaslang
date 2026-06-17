@@ -1,8 +1,10 @@
 from llvmlite import ir
+# Change 1: Added ThingNode, FieldAccessNode, and FieldAssignNode imports
 from ayasparser import (NumberNode, FloatNode, StringNode, IdentifierNode,
                         LetNode, AssignNode, ShowNode, UnaryOpNode, BinaryOpNode,
                         CompareNode, WhenNode, RepeatTimesNode, RepeatInNode,
-                        FunNode, CallNode, GiveBackNode)
+                        FunNode, CallNode, GiveBackNode,
+                        ThingNode, FieldAccessNode, FieldAssignNode)
 
 int_type   = ir.IntType(64)
 float_type = ir.DoubleType()
@@ -37,11 +39,18 @@ TYPE_NAMES = {
 }
 
 class Codegen:
+    # Change 2 & Change 10: Expanded initialization to register structs and track variable struct types
     def __init__(self):
-        self.module    = ir.Module(name="ayas")
-        self.builder   = None
-        self.vars      = {}
-        self.functions = {}
+        self.module          = ir.Module(name="ayas")
+        self.builder         = None
+        self.vars            = {}
+        self.functions       = {}
+        # struct registry: name -> {"type": ir.LiteralStructType,
+        # "fields": [field names in order], "field_types": [llvm types]}
+        self.things          = {}
+        # tracks which `thing` type a variable holds, e.g.
+        # var_thing_types["enemy"] = "Enemy"
+        self.var_thing_types = {}
         self.setup_printf()
 
     def alloca(self, typ, name=""):
@@ -77,6 +86,59 @@ class Codegen:
         self.llvm_sin = ir.Function(self.module, trig_ty, name="llvm.sin.f64")
         self.llvm_cos = ir.Function(self.module, trig_ty, name="llvm.cos.f64")
 
+    # Change 4: New method to register a struct shape as an LLVM LiteralStructType
+    def gen_thing(self, node):
+        """Registers a `thing Name { field: type ... }` definition as a
+        named LLVM struct type. No code is generated here — this just
+        records the shape so Name(...) construction and .field access
+        know what they're working with."""
+        field_types = [TYPE_NAMES.get(t, int_type) for t in node.field_types]
+        struct_type = ir.LiteralStructType(field_types)
+        self.things[node.name] = {
+            "type":        struct_type,
+            "fields":      node.fields,
+            "field_types": field_types,
+        }
+
+    # Change 6: New method to build out struct values field by field with type coercion
+    def gen_thing_constructor(self, node):
+        """Enemy(5.0, 10.0, 100) — builds a struct value field by field,
+        in declared order. Each argument is coerced to its field's type
+        (so passing a plain 0 where a field is `: float` works, same as
+        function call arguments)."""
+        info   = self.things[node.name]
+        stype  = info["type"]
+        ftypes = info["field_types"]
+
+        if len(node.args) != len(ftypes):
+            raise Exception(f"{node.name}(...) expects {len(ftypes)} argument(s), got {len(node.args)}")
+
+        result = ir.Constant(stype, ir.Undefined)
+        for i, arg in enumerate(node.args):
+            val = self.coerce_to(self.gen_expr(arg), ftypes[i])
+            result = self.builder.insert_value(result, val, i)
+        return result
+
+    # Change 8: New helper lookups and extraction tools for mapping field reads
+    def get_field_index(self, struct_name, field_name):
+        """Looks up a struct instance's declared type by variable name,
+        then finds the field's position in that type's field list."""
+        thing_name = self.var_thing_types.get(struct_name)
+        if thing_name is None:
+            raise Exception(f"'{struct_name}' is not a struct instance")
+        info = self.things[thing_name]
+        if field_name not in info["fields"]:
+            raise Exception(f"'{thing_name}' has no field '{field_name}'")
+        return info, info["fields"].index(field_name)
+
+    def gen_field_access(self, node):
+        ptr = self.vars.get(node.name)
+        if ptr is None:
+            raise Exception(f"Unknown variable: {node.name}")
+        info, idx = self.get_field_index(node.name, node.field)
+        struct_val = self.builder.load(ptr, name=node.name)
+        return self.builder.extract_value(struct_val, idx)
+
     def flush_stdout(self):
         """Force any buffered printf output to actually appear right now —
         otherwise if the program crashes later, output already produced
@@ -84,9 +146,14 @@ class Codegen:
         null_ptr = ir.Constant(self.voidptr_ty, None)
         self.builder.call(self.fflush, [null_ptr])
 
+    # Change 3: Reprioritized statement handling to isolate and build Thing definitions first
     def generate(self, statements):
+        thing_nodes     = [s for s in statements if isinstance(s, ThingNode)]
         fun_nodes       = [s for s in statements if isinstance(s, FunNode)]
-        main_statements = [s for s in statements if not isinstance(s, FunNode)]
+        main_statements = [s for s in statements if not isinstance(s, (FunNode, ThingNode))]
+
+        for thing in thing_nodes:
+            self.gen_thing(thing)
 
         # Work out each function's parameter types from its `: type`
         # annotations (a bare param with no annotation defaults to "number",
@@ -241,6 +308,7 @@ class Codegen:
             return int_type
 
     def gen_statement(self, node):
+        # Change 11: Expanded assignment variable logging to record mapped struct instance tags
         if isinstance(node, LetNode):
             value = self.gen_expr(node.value)
             # alloca the type of whatever the expression produced — i64 for
@@ -250,6 +318,8 @@ class Codegen:
             ptr = self.alloca(value.type, name=node.name)
             self.builder.store(value, ptr)
             self.vars[node.name] = ptr
+            if isinstance(node.value, CallNode) and node.value.name in self.things:
+                self.var_thing_types[node.name] = node.value.name
 
         elif isinstance(node, AssignNode):
             ptr = self.vars.get(node.name)
@@ -257,6 +327,17 @@ class Codegen:
                 raise Exception(f"Cannot assign to undeclared variable: '{node.name}' — use 'let {node.name} be ...' first")
             value = self.gen_expr(node.value)
             self.builder.store(value, ptr)
+
+        # Change 9: Added target operations block to execute field value re-assignments
+        elif isinstance(node, FieldAssignNode):
+            ptr = self.vars.get(node.name)
+            if ptr is None:
+                raise Exception(f"Cannot assign to undeclared variable: '{node.name}' — use 'let {node.name} be ...' first")
+            info, idx  = self.get_field_index(node.name, node.field)
+            value      = self.coerce_to(self.gen_expr(node.value), info["field_types"][idx])
+            struct_val = self.builder.load(ptr, name=node.name)
+            struct_val = self.builder.insert_value(struct_val, value, idx)
+            self.builder.store(struct_val, ptr)
 
         elif isinstance(node, ShowNode):
             self.gen_show(node)
@@ -513,6 +594,10 @@ class Codegen:
                 raise Exception(f"Unknown variable: {node.name}")
             return self.builder.load(ptr, name=node.name)
 
+        # Change 7: Added routing checks to compile FieldAccess structures
+        elif isinstance(node, FieldAccessNode):
+            return self.gen_field_access(node)
+
         elif isinstance(node, UnaryOpNode):
             value = self.gen_expr(node.operand)
             if node.op == "-":
@@ -549,6 +634,10 @@ class Codegen:
                 raise Exception(f"Unknown binary operator: {node.op}")
 
         elif isinstance(node, CallNode):
+            # Change 5: Expanded constructor evaluation to intercept declared structs first
+            if node.name in self.things:
+                return self.gen_thing_constructor(node)
+
             if node.name in VECTOR_TYPES:
                 return self.gen_vector_constructor(node)
 

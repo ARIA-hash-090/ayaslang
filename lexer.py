@@ -170,6 +170,9 @@ class Lexer:
             elif char == ":":
                 self.tokens.append(Token(TokenType.COLON, ":", self.line))
                 self.advance()
+            elif char == ".":
+                self.tokens.append(Token(TokenType.DOT, ".", self.line))
+                self.advance()
             else:
                 print(f"Unknown character '{char}' on line {self.line}")
                 self.advance()
