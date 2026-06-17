@@ -1,0 +1,15 @@
+repeat i in [0 to 5] {
+    show i
+}
+
+let n be 3
+repeat j in [0 to n] {
+    show j
+}
+
+fun add(a, b) {
+    give back [a + b]
+}
+
+let result be [add(3, 4)]
+show result
