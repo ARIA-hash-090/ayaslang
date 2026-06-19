@@ -1,3 +1,0 @@
-let r be mat4_rotate_z(1.5707963267948966)
-let p be vec4(1, 0, 0, 1)
-show [r * p]
