@@ -1,33 +1,30 @@
 from llvmlite import ir
-# Change 1: Added ThingNode, FieldAccessNode, and FieldAssignNode imports
 from ayasparser import (NumberNode, FloatNode, StringNode, IdentifierNode,
                         LetNode, AssignNode, ShowNode, UnaryOpNode, BinaryOpNode,
                         CompareNode, WhenNode, RepeatTimesNode, RepeatInNode,
                         FunNode, CallNode, GiveBackNode,
-                        ThingNode, FieldAccessNode, FieldAssignNode)
+                        ThingNode, FieldAccessNode, FieldAssignNode,
+                        ArrayLiteralNode, IndexAccessNode, IndexAssignNode,
+                        MethodCallNode)
 
 int_type   = ir.IntType(64)
 float_type = ir.DoubleType()
 bool_type  = ir.IntType(1)
 void_type  = ir.VoidType()
 
-# vec2/vec3/vec4 are LLVM vector types of doubles. Using real LLVM vectors
-# (rather than structs) means [+ - * /] become single fadd/fsub/fmul/fdiv
-# instructions across all components, and the optimizer can map them to
-# SIMD registers directly. This is the only "type" addition for now —
-# kept deliberately minimal per the games-only / no-bloat scope.
 VECTOR_TYPES = {
     "vec2": ir.VectorType(float_type, 2),
     "vec3": ir.VectorType(float_type, 3),
     "vec4": ir.VectorType(float_type, 4),
 }
 
-# A 4x4 matrix is stored as 4 rows, each row a vec4 — i.e. an array of 4
-# vec4s. Row-major: mat4[i] is row i, mat4[i][j] is row i, column j.
 MAT4_TYPE = ir.ArrayType(VECTOR_TYPES["vec4"], 4)
 
-# Maps the type names usable in `fun foo(a: vec3)` annotations to their
-# LLVM types. "number" (the default) is i64, "float" is a double.
+STRING_TYPE = ir.IntType(8).as_pointer()
+
+ARRAY_ELEM_SIZE = 8
+ARRAY_INIT_CAP  = 4
+
 TYPE_NAMES = {
     "number": int_type,
     "int":    int_type,
@@ -39,29 +36,21 @@ TYPE_NAMES = {
 }
 
 class Codegen:
-    # Change 2 & Change 10: Expanded initialization to register structs and track variable struct types
     def __init__(self):
         self.module          = ir.Module(name="ayas")
         self.builder         = None
         self.vars            = {}
         self.functions       = {}
-        # struct registry: name -> {"type": ir.LiteralStructType,
-        # "fields": [field names in order], "field_types": [llvm types]}
         self.things          = {}
-        # tracks which `thing` type a variable holds, e.g.
-        # var_thing_types["enemy"] = "Enemy"
         self.var_thing_types = {}
+        self.string_literals = {}
+        self.var_array_elem_types     = {}
+        self._pending_array_elem_type = None
         self.setup_printf()
+        self.setup_arena()
+        self.ARRAY_HEADER_TYPE = ir.LiteralStructType([int_type, int_type, self.voidptr_ty])
 
     def alloca(self, typ, name=""):
-        """alloca, but capped at 16-byte alignment. By default LLVM gives
-        vec4/mat4 (32-byte values) 32-byte alignment, which forces the
-        function to dynamically realign its stack (`and rsp, -32`). On
-        Windows this can produce a function whose prologue/unwind info is
-        broken, crashing the moment the function is entered — before any
-        of its code (including the very first `show`) ever runs. Capping
-        at 16 avoids that entirely; 16-byte-unaligned access to doubles
-        has no correctness cost on x86-64."""
         ptr = self.builder.alloca(typ, name=name)
         ptr.align = 16
         return ptr
@@ -70,28 +59,81 @@ class Codegen:
         voidptr_ty  = ir.IntType(8).as_pointer()
         printf_ty   = ir.FunctionType(ir.IntType(32), [voidptr_ty], var_arg=True)
         self.printf = ir.Function(self.module, printf_ty, name="printf")
-
         fflush_ty   = ir.FunctionType(ir.IntType(32), [voidptr_ty])
         self.fflush = ir.Function(self.module, fflush_ty, name="fflush")
         self.voidptr_ty = voidptr_ty
-
-        # sin/cos for mat4_rotate_x/y/z. Declared as the standard LLVM
-        # intrinsics (rather than calling out to a hand-named "sin"/"cos"
-        # function) so the backend lowers them itself — on x86-64 this
-        # becomes a real call to the platform's libm/CRT sin/cos, the same
-        # functions a C compiler would emit for `sin()`/`cos()`. Using the
-        # intrinsic form means we don't have to know in advance which C
-        # runtime symbol name is correct on a given target.
         trig_ty   = ir.FunctionType(float_type, [float_type])
         self.llvm_sin = ir.Function(self.module, trig_ty, name="llvm.sin.f64")
         self.llvm_cos = ir.Function(self.module, trig_ty, name="llvm.cos.f64")
 
-    # Change 4: New method to register a struct shape as an LLVM LiteralStructType
+    ARENA_CAPACITY_BYTES = 1024 * 1024
+
+    def setup_arena(self):
+        malloc_ty  = ir.FunctionType(self.voidptr_ty, [int_type])
+        self.malloc = ir.Function(self.module, malloc_ty, name="malloc")
+        free_ty    = ir.FunctionType(void_type, [self.voidptr_ty])
+        self.free  = ir.Function(self.module, free_ty, name="free")
+
+        self.arena_buf_global = ir.GlobalVariable(self.module, self.voidptr_ty, name="ayas_arena_buf")
+        self.arena_buf_global.linkage     = "internal"
+        self.arena_buf_global.initializer = ir.Constant(self.voidptr_ty, None)
+
+        self.arena_offset_global = ir.GlobalVariable(self.module, int_type, name="ayas_arena_offset")
+        self.arena_offset_global.linkage     = "internal"
+        self.arena_offset_global.initializer = ir.Constant(int_type, 0)
+
+        memcpy_ty = ir.FunctionType(void_type, [
+            self.voidptr_ty, self.voidptr_ty, int_type, bool_type
+        ])
+        self.llvm_memcpy = ir.Function(self.module, memcpy_ty,
+                                       name="llvm.memcpy.p0i8.p0i8.i64")
+
+    def gen_arena_init(self):
+        size = ir.Constant(int_type, self.ARENA_CAPACITY_BYTES)
+        buf  = self.builder.call(self.malloc, [size])
+        self.builder.store(buf, self.arena_buf_global)
+        self.builder.store(ir.Constant(int_type, 0), self.arena_offset_global)
+
+    def gen_arena_shutdown(self):
+        buf = self.builder.load(self.arena_buf_global)
+        self.builder.call(self.free, [buf])
+
+    def gen_arena_alloc(self, node):
+        if len(node.args) != 1:
+            raise Exception("arena_alloc(size) expects 1 argument")
+        size = self.gen_expr(node.args[0])
+        if size.type != int_type:
+            raise Exception(f"arena_alloc(size) expects a number, got {size.type}")
+        offset     = self.builder.load(self.arena_offset_global)
+        buf        = self.builder.load(self.arena_buf_global)
+        new_offset = self.builder.add(offset, size)
+        self.builder.store(new_offset, self.arena_offset_global)
+        result_ptr = self.builder.gep(buf, [offset])
+        return self.builder.ptrtoint(result_ptr, int_type)
+
+    def gen_arena_reset(self, node):
+        if len(node.args) != 0:
+            raise Exception("arena_reset() takes no arguments")
+        self.builder.store(ir.Constant(int_type, 0), self.arena_offset_global)
+        return ir.Constant(int_type, 0)
+
+    def gen_peek_i64(self, node):
+        if len(node.args) != 1:
+            raise Exception("peek_i64(addr) expects 1 argument")
+        addr = self.gen_expr(node.args[0])
+        ptr  = self.builder.inttoptr(addr, int_type.as_pointer())
+        return self.builder.load(ptr)
+
+    def gen_poke_i64(self, node):
+        if len(node.args) != 2:
+            raise Exception("poke_i64(addr, value) expects 2 arguments")
+        addr  = self.gen_expr(node.args[0])
+        value = self.gen_expr(node.args[1])
+        ptr   = self.builder.inttoptr(addr, int_type.as_pointer())
+        self.builder.store(value, ptr)
+        return ir.Constant(int_type, 0)
+
     def gen_thing(self, node):
-        """Registers a `thing Name { field: type ... }` definition as a
-        named LLVM struct type. No code is generated here — this just
-        records the shape so Name(...) construction and .field access
-        know what they're working with."""
         field_types = [TYPE_NAMES.get(t, int_type) for t in node.field_types]
         struct_type = ir.LiteralStructType(field_types)
         self.things[node.name] = {
@@ -100,29 +142,19 @@ class Codegen:
             "field_types": field_types,
         }
 
-    # Change 6: New method to build out struct values field by field with type coercion
     def gen_thing_constructor(self, node):
-        """Enemy(5.0, 10.0, 100) — builds a struct value field by field,
-        in declared order. Each argument is coerced to its field's type
-        (so passing a plain 0 where a field is `: float` works, same as
-        function call arguments)."""
         info   = self.things[node.name]
         stype  = info["type"]
         ftypes = info["field_types"]
-
         if len(node.args) != len(ftypes):
             raise Exception(f"{node.name}(...) expects {len(ftypes)} argument(s), got {len(node.args)}")
-
         result = ir.Constant(stype, ir.Undefined)
         for i, arg in enumerate(node.args):
             val = self.coerce_to(self.gen_expr(arg), ftypes[i])
             result = self.builder.insert_value(result, val, i)
         return result
 
-    # Change 8: New helper lookups and extraction tools for mapping field reads
     def get_field_index(self, struct_name, field_name):
-        """Looks up a struct instance's declared type by variable name,
-        then finds the field's position in that type's field list."""
         thing_name = self.var_thing_types.get(struct_name)
         if thing_name is None:
             raise Exception(f"'{struct_name}' is not a struct instance")
@@ -135,18 +167,230 @@ class Codegen:
         ptr = self.vars.get(node.name)
         if ptr is None:
             raise Exception(f"Unknown variable: {node.name}")
+        if node.name in self.var_array_elem_types:
+            if node.field == "length":
+                return self.gen_array_length(ptr)
+            raise Exception(f"Arrays only support '.length' — use .append() to add elements")
         info, idx = self.get_field_index(node.name, node.field)
         struct_val = self.builder.load(ptr, name=node.name)
         return self.builder.extract_value(struct_val, idx)
 
     def flush_stdout(self):
-        """Force any buffered printf output to actually appear right now —
-        otherwise if the program crashes later, output already produced
-        can be lost entirely (looking like 'no output at all')."""
         null_ptr = ir.Constant(self.voidptr_ty, None)
         self.builder.call(self.fflush, [null_ptr])
 
-    # Change 3: Reprioritized statement handling to isolate and build Thing definitions first
+    # ------------------------------------------------------------------
+    # Array runtime helpers
+    # ------------------------------------------------------------------
+
+    def _arr_load_header(self, ptr):
+        return self.builder.load(ptr)
+
+    def gen_array_length(self, ptr):
+        return self.builder.extract_value(self._arr_load_header(ptr), 0)
+
+    def gen_array_capacity(self, ptr):
+        return self.builder.extract_value(self._arr_load_header(ptr), 1)
+
+    def gen_array_data_ptr(self, ptr):
+        return self.builder.extract_value(self._arr_load_header(ptr), 2)
+
+    def gen_array_elem_ptr_from_data(self, data_ptr, index_val):
+        byte_off = self.builder.mul(index_val, ir.Constant(int_type, ARRAY_ELEM_SIZE))
+        elem_raw = self.builder.gep(data_ptr, [byte_off])
+        return self.builder.bitcast(elem_raw, int_type.as_pointer())
+
+    def _elem_to_i64(self, val, elem_type):
+        if val.type == int_type:
+            return val
+        if val.type == float_type:
+            return self.builder.bitcast(val, int_type)
+        if val.type == STRING_TYPE:
+            return self.builder.ptrtoint(val, int_type)
+        raise Exception(f"Arrays don't support element type {val.type} yet")
+
+    def _i64_to_elem(self, raw, elem_type):
+        if elem_type == int_type:
+            return raw
+        if elem_type == float_type:
+            return self.builder.bitcast(raw, float_type)
+        if elem_type == STRING_TYPE:
+            return self.builder.inttoptr(raw, STRING_TYPE)
+        raise Exception(f"Arrays don't support element type {elem_type} yet")
+
+    def gen_array_bounds_check(self, ptr, index_val, var_name):
+        length = self.gen_array_length(ptr)
+        func   = self.builder.block.function
+        ok_block   = func.append_basic_block("bounds_ok")
+        fail_block = func.append_basic_block("bounds_fail")
+        too_low  = self.builder.icmp_signed("<",  index_val, ir.Constant(int_type, 0))
+        too_high = self.builder.icmp_signed(">=", index_val, length)
+        oob      = self.builder.or_(too_low, too_high)
+        self.builder.cbranch(oob, fail_block, ok_block)
+        self.builder.position_at_end(fail_block)
+        self.print_text("Error: array index out of bounds\n", "str_oob_error")
+        self.builder.ret(ir.Constant(ir.IntType(32), 1))
+        self.builder.position_at_end(ok_block)
+
+    def gen_array_literal(self, node):
+        if len(node.elements) == 0:
+            elem_type = int_type
+            cap_val   = ir.Constant(int_type, ARRAY_INIT_CAP)
+        else:
+            first_val = self.gen_expr(node.elements[0])
+            elem_type = first_val.type
+            cap_val   = ir.Constant(int_type, max(ARRAY_INIT_CAP, len(node.elements)))
+
+        self._pending_array_elem_type = elem_type
+
+        byte_cnt   = self.builder.mul(cap_val, ir.Constant(int_type, ARRAY_ELEM_SIZE))
+        offset     = self.builder.load(self.arena_offset_global)
+        buf        = self.builder.load(self.arena_buf_global)
+        new_offset = self.builder.add(offset, byte_cnt)
+        self.builder.store(new_offset, self.arena_offset_global)
+        data_ptr   = self.builder.gep(buf, [offset])
+
+        for i, elem_node in enumerate(node.elements):
+            val = self.gen_expr(elem_node)
+            raw = self._elem_to_i64(val, elem_type)
+            ep  = self.gen_array_elem_ptr_from_data(data_ptr, ir.Constant(int_type, i))
+            self.builder.store(raw, ep)
+
+        len_val = ir.Constant(int_type, len(node.elements))
+        header  = ir.Constant(self.ARRAY_HEADER_TYPE, ir.Undefined)
+        header  = self.builder.insert_value(header, len_val, 0)
+        header  = self.builder.insert_value(header, cap_val, 1)
+        header  = self.builder.insert_value(header, data_ptr, 2)
+        return header
+
+    def gen_array_index_access(self, node):
+        ptr = self.vars.get(node.name)
+        if ptr is None:
+            raise Exception(f"Unknown variable: '{node.name}'")
+        elem_type = self.var_array_elem_types.get(node.name)
+        if elem_type is None:
+            raise Exception(f"'{node.name}' is not an array")
+        index_val = self.gen_expr(node.index)
+        if index_val.type != int_type:
+            raise Exception(f"Array index must be a number, got {index_val.type}")
+        self.gen_array_bounds_check(ptr, index_val, node.name)
+        data_ptr = self.gen_array_data_ptr(ptr)
+        ep       = self.gen_array_elem_ptr_from_data(data_ptr, index_val)
+        raw      = self.builder.load(ep)
+        return self._i64_to_elem(raw, elem_type)
+
+    def gen_array_index_assign(self, node):
+        ptr = self.vars.get(node.name)
+        if ptr is None:
+            raise Exception(f"Unknown variable: '{node.name}'")
+        elem_type = self.var_array_elem_types.get(node.name)
+        if elem_type is None:
+            raise Exception(f"'{node.name}' is not an array")
+        index_val = self.gen_expr(node.index)
+        if index_val.type != int_type:
+            raise Exception(f"Array index must be a number, got {index_val.type}")
+        self.gen_array_bounds_check(ptr, index_val, node.name)
+        val      = self.gen_expr(node.value)
+        raw      = self._elem_to_i64(val, elem_type)
+        data_ptr = self.gen_array_data_ptr(ptr)
+        ep       = self.gen_array_elem_ptr_from_data(data_ptr, index_val)
+        self.builder.store(raw, ep)
+
+    def gen_array_append(self, var_name, arg_val):
+        ptr = self.vars.get(var_name)
+        if ptr is None:
+            raise Exception(f"Unknown variable: '{var_name}'")
+        elem_type = self.var_array_elem_types.get(var_name)
+        if elem_type is None:
+            raise Exception(f"'{var_name}' is not an array")
+        func = self.builder.block.function
+
+        length   = self.gen_array_length(ptr)
+        capacity = self.gen_array_capacity(ptr)
+        is_full  = self.builder.icmp_signed(">=", length, capacity)
+
+        grow_block = func.append_basic_block("array_grow")
+        cont_block = func.append_basic_block("array_append_cont")
+        self.builder.cbranch(is_full, grow_block, cont_block)
+
+        self.builder.position_at_end(grow_block)
+        old_cap      = self.gen_array_capacity(ptr)
+        new_cap      = self.builder.mul(old_cap, ir.Constant(int_type, 2))
+        new_byte_cnt = self.builder.mul(new_cap, ir.Constant(int_type, ARRAY_ELEM_SIZE))
+        old_byte_cnt = self.builder.mul(old_cap, ir.Constant(int_type, ARRAY_ELEM_SIZE))
+        offset     = self.builder.load(self.arena_offset_global)
+        buf        = self.builder.load(self.arena_buf_global)
+        new_offset = self.builder.add(offset, new_byte_cnt)
+        self.builder.store(new_offset, self.arena_offset_global)
+        new_data   = self.builder.gep(buf, [offset])
+        old_data   = self.gen_array_data_ptr(ptr)
+        false_val  = ir.Constant(bool_type, 0)
+        self.builder.call(self.llvm_memcpy, [new_data, old_data, old_byte_cnt, false_val])
+        header = self.builder.load(ptr)
+        header = self.builder.insert_value(header, new_cap, 1)
+        header = self.builder.insert_value(header, new_data, 2)
+        self.builder.store(header, ptr)
+        self.builder.branch(cont_block)
+
+        self.builder.position_at_end(cont_block)
+        cur_len  = self.gen_array_length(ptr)
+        raw      = self._elem_to_i64(arg_val, elem_type)
+        data_ptr = self.gen_array_data_ptr(ptr)
+        ep       = self.gen_array_elem_ptr_from_data(data_ptr, cur_len)
+        self.builder.store(raw, ep)
+        new_len = self.builder.add(cur_len, ir.Constant(int_type, 1))
+        header  = self.builder.load(ptr)
+        header  = self.builder.insert_value(header, new_len, 0)
+        self.builder.store(header, ptr)
+
+    def gen_method_call(self, node):
+        if node.method == "append":
+            if len(node.args) != 1:
+                raise Exception(f".append() takes exactly 1 argument, got {len(node.args)}")
+            arg_val = self.gen_expr(node.args[0])
+            self.gen_array_append(node.name, arg_val)
+            return ir.Constant(int_type, 0)
+        raise Exception(f"Unknown method '.{node.method}' — only .append() is supported on arrays")
+
+    def gen_show_array(self, var_name):
+        ptr       = self.vars[var_name]
+        elem_type = self.var_array_elem_types[var_name]
+        func      = self.builder.block.function
+        length    = self.gen_array_length(ptr)
+        i_ptr = self.alloca(int_type, name="show_arr_i")
+        self.builder.store(ir.Constant(int_type, 0), i_ptr)
+        check_block = func.append_basic_block("show_arr_check")
+        body_block  = func.append_basic_block("show_arr_body")
+        end_block   = func.append_basic_block("show_arr_end")
+        self.builder.branch(check_block)
+        self.builder.position_at_end(check_block)
+        i_val = self.builder.load(i_ptr)
+        cond  = self.builder.icmp_signed("<", i_val, length)
+        self.builder.cbranch(cond, body_block, end_block)
+        self.builder.position_at_end(body_block)
+        self.print_text("[", "str_arr_lb")
+        self.print_int_fmt(i_val, "%lld", "fmt_arr_idx")
+        self.print_text("]: ", "str_arr_colon")
+        data_ptr = self.gen_array_data_ptr(ptr)
+        ep       = self.gen_array_elem_ptr_from_data(data_ptr, i_val)
+        raw      = self.builder.load(ep)
+        elem_val = self._i64_to_elem(raw, elem_type)
+        if elem_type == float_type:
+            self.gen_show_double(elem_val)
+            self.print_text("\n", "str_newline")
+        elif elem_type == STRING_TYPE:
+            self.print_string_fmt(elem_val, "fmt_string")
+        else:
+            self.print_int_fmt(elem_val, "%lld\n\0", "fmt_int")
+        next_i = self.builder.add(i_val, ir.Constant(int_type, 1))
+        self.builder.store(next_i, i_ptr)
+        self.builder.branch(check_block)
+        self.builder.position_at_end(end_block)
+
+    # ------------------------------------------------------------------
+    # generate / gen_function
+    # ------------------------------------------------------------------
+
     def generate(self, statements):
         thing_nodes     = [s for s in statements if isinstance(s, ThingNode)]
         fun_nodes       = [s for s in statements if isinstance(s, FunNode)]
@@ -155,50 +399,39 @@ class Codegen:
         for thing in thing_nodes:
             self.gen_thing(thing)
 
-        # Work out each function's parameter types from its `: type`
-        # annotations (a bare param with no annotation defaults to "number",
-        # i.e. i64 — same as before).
         fn_param_types = {}
         for fn in fun_nodes:
             fn_param_types[fn.name] = [
                 TYPE_NAMES.get(t, int_type) for t in fn.param_types
             ]
 
-        # Return types aren't annotated — they're inferred from whatever
-        # `give back` produces. A function's return type can depend on
-        # what other functions it calls, so we infer in two passes:
-        # pass 1 assumes every call returns a number (i64), pass 2 redoes
-        # inference using pass 1's results. This covers normal call chains
-        # (a function calling helper functions) without needing the user
-        # to write any type annotations on return values.
         fn_return_types = {fn.name: int_type for fn in fun_nodes}
         for _ in range(2):
             for fn in fun_nodes:
                 fn_return_types[fn.name] = self.infer_function_return_type(
                     fn, fn_param_types[fn.name], fn_return_types)
 
-        # Pass 1: declare every function's signature first, so calls work
-        # regardless of declaration order (and recursion works too).
         for fn in fun_nodes:
             fn_ty   = ir.FunctionType(fn_return_types[fn.name], fn_param_types[fn.name])
             ir_func = ir.Function(self.module, fn_ty, name=fn.name)
             self.functions[fn.name] = ir_func
 
-        # Pass 2: generate each function's body with its own fresh scope.
         for fn in fun_nodes:
             self.gen_function(fn)
 
-        # Generate main from whatever's left over at the top level.
         main_ty   = ir.FunctionType(ir.IntType(32), [])
         main_func = ir.Function(self.module, main_ty, name="main")
         block     = main_func.append_basic_block(name="entry")
         self.builder = ir.IRBuilder(block)
         self.vars = {}
 
+        self.gen_arena_init()
+
         for stmt in main_statements:
             self.gen_statement(stmt)
 
         if not self.builder.block.is_terminated:
+            self.gen_arena_shutdown()
             self.builder.ret(ir.Constant(ir.IntType(32), 0))
 
         return self.module
@@ -224,9 +457,6 @@ class Codegen:
             self.builder.ret(self.zero_value(self.current_return_type))
 
     def zero_value(self, t):
-        """A reasonable 'nothing happened' default value for a type —
-        used as the implicit return when a function falls off the end
-        without a `give back`."""
         if isinstance(t, ir.VectorType):
             return ir.Constant(t, [ir.Constant(float_type, 0.0)] * t.count)
         if t == MAT4_TYPE:
@@ -234,11 +464,8 @@ class Codegen:
         return ir.Constant(t, 0)
 
     # ------------------------------------------------------------------
-    # Type inference for function return types
+    # Type inference
     # ------------------------------------------------------------------
-    # These mirror the *type rules* of gen_expr/gen_statement without
-    # generating any IR — just figuring out what LLVM type a function's
-    # `give back` expression(s) will produce, given its parameter types.
 
     def infer_function_return_type(self, fn, param_types, fn_return_types):
         type_env = dict(zip(fn.params, param_types))
@@ -246,9 +473,6 @@ class Codegen:
         return result if result is not None else int_type
 
     def infer_walk(self, body, type_env, fn_return_types):
-        """Walks statements (mutating type_env for `let`s, like gen_statement
-        mutates self.vars), returning the type of the first `give back`
-        found, or None if this body never returns."""
         for stmt in body:
             if isinstance(stmt, LetNode):
                 type_env[stmt.name] = self.infer_expr_type(stmt.value, type_env, fn_return_types)
@@ -307,17 +531,20 @@ class Codegen:
         else:
             return int_type
 
+    # ------------------------------------------------------------------
+    # Statements
+    # ------------------------------------------------------------------
+
     def gen_statement(self, node):
-        # Change 11: Expanded assignment variable logging to record mapped struct instance tags
         if isinstance(node, LetNode):
+            self._pending_array_elem_type = None
             value = self.gen_expr(node.value)
-            # alloca the type of whatever the expression produced — i64 for
-            # ints, double for floats. This is how variable "type" is
-            # tracked: there's no separate type table, the IR value's own
-            # type (and therefore the alloca's pointee type) carries it.
             ptr = self.alloca(value.type, name=node.name)
             self.builder.store(value, ptr)
             self.vars[node.name] = ptr
+            if self._pending_array_elem_type is not None:
+                self.var_array_elem_types[node.name] = self._pending_array_elem_type
+                self._pending_array_elem_type = None
             if isinstance(node.value, CallNode) and node.value.name in self.things:
                 self.var_thing_types[node.name] = node.value.name
 
@@ -328,7 +555,6 @@ class Codegen:
             value = self.gen_expr(node.value)
             self.builder.store(value, ptr)
 
-        # Change 9: Added target operations block to execute field value re-assignments
         elif isinstance(node, FieldAssignNode):
             ptr = self.vars.get(node.name)
             if ptr is None:
@@ -338,6 +564,12 @@ class Codegen:
             struct_val = self.builder.load(ptr, name=node.name)
             struct_val = self.builder.insert_value(struct_val, value, idx)
             self.builder.store(struct_val, ptr)
+
+        elif isinstance(node, IndexAssignNode):
+            self.gen_array_index_assign(node)
+
+        elif isinstance(node, MethodCallNode):
+            self.gen_method_call(node)
 
         elif isinstance(node, ShowNode):
             self.gen_show(node)
@@ -357,20 +589,20 @@ class Codegen:
             self.builder.ret(value)
 
         elif isinstance(node, CallNode):
-            # Called as a standalone statement — evaluate for side effects,
-            # discard the returned value.
             self.gen_expr(node)
+
+    # ------------------------------------------------------------------
+    # Print helpers
+    # ------------------------------------------------------------------
 
     DECIMAL_PLACES = 4
     DECIMAL_SCALE  = 10 ** DECIMAL_PLACES
 
     def get_global_string(self, text, name):
-        """Returns an i8* to a null-terminated global string constant,
-        creating it once per unique name."""
         full_text = text + "\0"
         if name not in self.module.globals:
             c_str = ir.Constant(ir.ArrayType(ir.IntType(8), len(full_text)),
-                                 bytearray(full_text.encode("utf8")))
+                                bytearray(full_text.encode("utf8")))
             g = ir.GlobalVariable(self.module, c_str.type, name=name)
             g.linkage         = "internal"
             g.global_constant = True
@@ -378,41 +610,53 @@ class Codegen:
         return self.builder.bitcast(self.module.globals[name], ir.IntType(8).as_pointer())
 
     def print_text(self, text, name):
-        """printf with no extra arguments — just a literal string (must
-        not contain '%')."""
         ptr = self.get_global_string(text, name)
         self.builder.call(self.printf, [ptr])
         self.flush_stdout()
 
     def print_int_fmt(self, value, fmt, name):
-        """printf with a single i64 argument. Only ever passes integers
-        to printf — never doubles (see gen_show_double)."""
         ptr = self.get_global_string(fmt, name)
         self.builder.call(self.printf, [ptr, value])
         self.flush_stdout()
 
+    def print_string_fmt(self, value, name):
+        ptr = self.get_global_string("%s\n", name)
+        self.builder.call(self.printf, [ptr, value])
+        self.flush_stdout()
+
+    def gen_string_literal(self, node):
+        if node.value not in self.string_literals:
+            self.string_literals[node.value] = f"str_lit_{len(self.string_literals)}"
+        name = self.string_literals[node.value]
+        return self.get_global_string(node.value, name)
+
     def gen_show(self, node):
+        if isinstance(node.value, IdentifierNode):
+            arr_name = node.value.name
+            if arr_name in self.var_array_elem_types:
+                self.gen_show_array(arr_name)
+                return
+
         value = self.gen_expr(node.value)
 
         if isinstance(value.type, ir.VectorType):
             self.gen_show_vector(value)
             return
-
         if value.type == MAT4_TYPE:
             for i in range(4):
                 row = self.builder.extract_value(value, i)
                 self.gen_show_vector(row)
             return
-
         if value.type == float_type:
             self.gen_show_double(value)
             self.print_text("\n", "str_newline")
             return
-
+        if value.type == STRING_TYPE:
+            self.print_string_fmt(value, "fmt_string")
+            return
         self.print_int_fmt(value, "%lld\n\0", "fmt_int")
 
     def gen_show_vector(self, value):
-        """Print a vec2/vec3/vec4 as (x, y, z)."""
         size = value.type.count
         self.print_text("(", "str_lparen")
         for i in range(size):
@@ -423,11 +667,6 @@ class Codegen:
         self.print_text(")\n", "str_rparen_nl")
 
     def gen_show_double(self, value):
-        """Prints a double with DECIMAL_PLACES decimal digits, e.g.
-        '1.5000' or '-2.0000', using ONLY integer printf calls plus plain
-        string literals — never passing a `double` to printf's varargs.
-        That's the part that's notoriously fragile on Windows x64 when the
-        IR is hand-written rather than produced by a C compiler."""
         is_neg = self.builder.fcmp_ordered("<", value, ir.Constant(float_type, 0.0))
         with self.builder.if_then(is_neg):
             self.print_text("-", "str_minus")
@@ -441,9 +680,6 @@ class Codegen:
         scaled_f = self.builder.fadd(scaled_f, ir.Constant(float_type, 0.5))
         scaled   = self.builder.fptosi(scaled_f, int_type)
 
-        # Rounding can carry the fractional part all the way up to
-        # DECIMAL_SCALE (e.g. 1.99996 -> int=1, frac scaled=10000).
-        # In that case bump the integer part instead and zero the frac.
         scale_const = ir.Constant(int_type, self.DECIMAL_SCALE)
         overflow = self.builder.icmp_signed(">=", scaled, scale_const)
         int_part = self.builder.select(overflow, self.builder.add(int_part, ir.Constant(int_type, 1)), int_part)
@@ -452,6 +688,10 @@ class Codegen:
         self.print_int_fmt(int_part, "%lld\0", "fmt_int_plain")
         self.print_text(".", "str_dot")
         self.print_int_fmt(scaled, f"%0{self.DECIMAL_PLACES}lld\0", "fmt_frac")
+
+    # ------------------------------------------------------------------
+    # Control flow
+    # ------------------------------------------------------------------
 
     def gen_when(self, node):
         func  = self.builder.block.function
@@ -487,73 +727,57 @@ class Codegen:
 
     def gen_repeat_times(self, node):
         func = self.builder.block.function
-
         counter_ptr = self.alloca(int_type, name="repeat_counter")
         self.builder.store(ir.Constant(int_type, 0), counter_ptr)
-
         check_block = func.append_basic_block("repeat_check")
         body_block  = func.append_basic_block("repeat_body")
         end_block   = func.append_basic_block("repeat_end")
-
         self.builder.branch(check_block)
-
         self.builder.position_at_end(check_block)
         counter_val = self.builder.load(counter_ptr, name="counter")
         limit_val   = ir.Constant(int_type, int(node.count))
         cond        = self.builder.icmp_signed("<", counter_val, limit_val)
         self.builder.cbranch(cond, body_block, end_block)
-
         self.builder.position_at_end(body_block)
         for stmt in node.body:
             self.gen_statement(stmt)
-
         if not self.builder.block.is_terminated:
             counter_val = self.builder.load(counter_ptr, name="counter")
             next_val    = self.builder.add(counter_val, ir.Constant(int_type, 1))
             self.builder.store(next_val, counter_ptr)
             self.builder.branch(check_block)
-
         self.builder.position_at_end(end_block)
 
     def gen_repeat_in(self, node):
         func = self.builder.block.function
-
-        # Set up the loop variable like a normal `let`-declared variable
         var_ptr   = self.alloca(int_type, name=node.var_name)
         start_val = self.gen_expr(node.start)
         self.builder.store(start_val, var_ptr)
         self.vars[node.var_name] = var_ptr
-
-        # Evaluate the end bound once, before the loop starts
         end_val = self.gen_expr(node.end)
-
         check_block = func.append_basic_block("repeat_in_check")
         body_block  = func.append_basic_block("repeat_in_body")
         end_block   = func.append_basic_block("repeat_in_end")
-
         self.builder.branch(check_block)
-
         self.builder.position_at_end(check_block)
         current_val = self.builder.load(var_ptr, name=node.var_name)
         cond        = self.builder.icmp_signed("<", current_val, end_val)
         self.builder.cbranch(cond, body_block, end_block)
-
         self.builder.position_at_end(body_block)
         for stmt in node.body:
             self.gen_statement(stmt)
-
         if not self.builder.block.is_terminated:
             current_val = self.builder.load(var_ptr, name=node.var_name)
             next_val    = self.builder.add(current_val, ir.Constant(int_type, 1))
             self.builder.store(next_val, var_ptr)
             self.builder.branch(check_block)
-
         self.builder.position_at_end(end_block)
 
+    # ------------------------------------------------------------------
+    # Expressions
+    # ------------------------------------------------------------------
+
     def promote_to_common_type(self, left, right):
-        """If one side is i64 and the other is double, convert the i64 side
-        to double (sitofp) so both operands match. Returns
-        (left, right, is_float)."""
         if left.type == right.type:
             return left, right, (left.type == float_type)
         if left.type == int_type and right.type == float_type:
@@ -565,8 +789,9 @@ class Codegen:
     def gen_compare(self, node):
         left  = self.gen_expr(node.left)
         right = self.gen_expr(node.right)
+        if left.type == STRING_TYPE or right.type == STRING_TYPE:
+            raise Exception("Comparing strings with is/is not/>/< etc. isn't supported yet")
         left, right, is_float = self.promote_to_common_type(left, right)
-
         op = node.op
         if op == "is":
             cmp_op = "=="
@@ -576,7 +801,6 @@ class Codegen:
             cmp_op = op
         else:
             raise Exception(f"Unknown comparison operator: {op}")
-
         if is_float:
             return self.builder.fcmp_ordered(cmp_op, left, right)
         return self.builder.icmp_signed(cmp_op, left, right)
@@ -588,13 +812,24 @@ class Codegen:
         elif isinstance(node, FloatNode):
             return ir.Constant(float_type, float(node.value))
 
+        elif isinstance(node, StringNode):
+            return self.gen_string_literal(node)
+
         elif isinstance(node, IdentifierNode):
             ptr = self.vars.get(node.name)
             if ptr is None:
                 raise Exception(f"Unknown variable: {node.name}")
             return self.builder.load(ptr, name=node.name)
 
-        # Change 7: Added routing checks to compile FieldAccess structures
+        elif isinstance(node, ArrayLiteralNode):
+            return self.gen_array_literal(node)
+
+        elif isinstance(node, IndexAccessNode):
+            return self.gen_array_index_access(node)
+
+        elif isinstance(node, MethodCallNode):
+            return self.gen_method_call(node)
+
         elif isinstance(node, FieldAccessNode):
             return self.gen_field_access(node)
 
@@ -613,15 +848,13 @@ class Codegen:
         elif isinstance(node, BinaryOpNode):
             left  = self.gen_expr(node.left)
             right = self.gen_expr(node.right)
-
             if left.type == MAT4_TYPE or right.type == MAT4_TYPE:
                 return self.gen_mat4_binop(left, right, node.op)
-
             if isinstance(left.type, ir.VectorType) or isinstance(right.type, ir.VectorType):
                 return self.gen_vector_binop(left, right, node.op)
-
+            if left.type == STRING_TYPE or right.type == STRING_TYPE:
+                raise Exception("Strings don't support [+ - * /] yet")
             left, right, is_float = self.promote_to_common_type(left, right)
-
             if node.op == "+":
                 return self.builder.fadd(left, right) if is_float else self.builder.add(left, right)
             elif node.op == "-":
@@ -634,13 +867,10 @@ class Codegen:
                 raise Exception(f"Unknown binary operator: {node.op}")
 
         elif isinstance(node, CallNode):
-            # Change 5: Expanded constructor evaluation to intercept declared structs first
             if node.name in self.things:
                 return self.gen_thing_constructor(node)
-
             if node.name in VECTOR_TYPES:
                 return self.gen_vector_constructor(node)
-
             if node.name == "mat4":
                 return self.gen_mat4_constructor(node)
             if node.name == "mat4_identity":
@@ -655,7 +885,14 @@ class Codegen:
                 return self.gen_mat4_rotate_y(node)
             if node.name == "mat4_rotate_z":
                 return self.gen_mat4_rotate_z(node)
-
+            if node.name == "arena_alloc":
+                return self.gen_arena_alloc(node)
+            if node.name == "arena_reset":
+                return self.gen_arena_reset(node)
+            if node.name == "peek_i64":
+                return self.gen_peek_i64(node)
+            if node.name == "poke_i64":
+                return self.gen_poke_i64(node)
             func = self.functions.get(node.name)
             if func is None:
                 raise Exception(f"Unknown function: '{node.name}'")
@@ -666,10 +903,6 @@ class Codegen:
             return self.builder.call(func, arg_vals)
 
     def coerce_to(self, value, target_type):
-        """Converts a value to match an expected type where that's a sane,
-        lossless-ish thing to do (number <-> float). Used for `give back`
-        values and function-call arguments, so e.g. passing a plain `0`
-        where a function expects `: float` just works."""
         if value.type == target_type:
             return value
         if value.type == int_type and target_type == float_type:
@@ -679,24 +912,21 @@ class Codegen:
         raise Exception(f"Type mismatch: got {value.type}, expected {target_type}")
 
     def to_float(self, value):
-        """Coerces a number (int or float) to a double — used for the
-        x/y/z arguments of mat4_translate/mat4_scale."""
         if value.type == int_type:
             return self.builder.sitofp(value, float_type)
         if value.type == float_type:
             return value
         raise Exception(f"Expected a number, got {value.type}")
 
+    # ------------------------------------------------------------------
+    # Vector / mat4
+    # ------------------------------------------------------------------
+
     def gen_vector_constructor(self, node):
-        """vec2(x, y) / vec3(x, y, z) / vec4(x, y, z, w) — builds an LLVM
-        vector value lane by lane. Integer arguments are promoted to
-        doubles since vec2/3/4 are always vectors of doubles."""
         vtype = VECTOR_TYPES[node.name]
         size  = vtype.count
-
         if len(node.args) != size:
             raise Exception(f"{node.name}(...) expects {size} argument(s), got {len(node.args)}")
-
         result = ir.Constant(vtype, ir.Undefined)
         for i, arg in enumerate(node.args):
             val = self.gen_expr(arg)
@@ -708,25 +938,18 @@ class Codegen:
         return result
 
     def splat(self, scalar, vtype):
-        """Broadcast a scalar value into every lane of a vector of type
-        vtype — used so `[pos * 2]` and `[2 * pos]` work for scaling."""
         if scalar.type == int_type:
             scalar = self.builder.sitofp(scalar, float_type)
         elif scalar.type != float_type:
             raise Exception(f"Cannot use {scalar.type} as a vector component")
-
         result = ir.Constant(vtype, ir.Undefined)
         for i in range(vtype.count):
             result = self.builder.insert_element(result, scalar, ir.Constant(ir.IntType(32), i))
         return result
 
     def gen_vector_binop(self, left, right, op):
-        """[+ - * /] between two vectors (component-wise) or between a
-        vector and a scalar (the scalar is broadcast to every lane —
-        e.g. `[pos * 2]` scales every component)."""
         left_is_vec  = isinstance(left.type, ir.VectorType)
         right_is_vec = isinstance(right.type, ir.VectorType)
-
         if left_is_vec and right_is_vec:
             if left.type != right.type:
                 raise Exception(f"Cannot combine vectors of different sizes: {left.type} and {right.type}")
@@ -734,7 +957,6 @@ class Codegen:
             right = self.splat(right, left.type)
         elif right_is_vec:
             left = self.splat(left, right.type)
-
         if op == "+":
             return self.builder.fadd(left, right)
         elif op == "-":
@@ -746,14 +968,7 @@ class Codegen:
         else:
             raise Exception(f"Unknown vector operator: {op}")
 
-    # ------------------------------------------------------------------
-    # mat4 — a 4x4 matrix stored as 4 rows of vec4, row-major.
-    # Used for game/engine transforms (move, scale, rotate, project).
-    # ------------------------------------------------------------------
-
     def identity_mat4_constant(self):
-        """Returns the constant 4x4 identity matrix — the 'do nothing'
-        transform, and the standard starting point for building others."""
         rows = []
         for i in range(4):
             comps = [ir.Constant(float_type, 1.0 if i == j else 0.0) for j in range(4)]
@@ -761,13 +976,8 @@ class Codegen:
         return ir.Constant(MAT4_TYPE, rows)
 
     def gen_mat4_constructor(self, node):
-        """mat4(row0, row1, row2, row3) — builds a matrix from 4 vec4 rows.
-        Mostly useful if you want to build a custom matrix by hand; for
-        everyday use, mat4_identity()/mat4_translate()/mat4_scale() are
-        easier."""
         if len(node.args) != 4:
             raise Exception("mat4(...) expects 4 rows (each a vec4)")
-
         result = ir.Constant(MAT4_TYPE, ir.Undefined)
         for i, arg in enumerate(node.args):
             row = self.gen_expr(arg)
@@ -777,20 +987,13 @@ class Codegen:
         return result
 
     def gen_mat4_identity(self, node):
-        """mat4_identity() — the 'do nothing' transform. Start here when
-        building up a transform, e.g.:
-            let m be mat4_identity()
-        """
         if len(node.args) != 0:
             raise Exception("mat4_identity() takes no arguments")
         return self.identity_mat4_constant()
 
     def gen_mat4_translate(self, node):
-        """mat4_translate(x, y, z) — a matrix that moves a point by
-        (x, y, z) when multiplied with it: [m * vec4(px, py, pz, 1)]."""
         if len(node.args) != 3:
             raise Exception("mat4_translate(x, y, z) expects 3 numbers")
-
         result = self.identity_mat4_constant()
         for i, arg in enumerate(node.args):
             val = self.to_float(self.gen_expr(arg))
@@ -800,11 +1003,8 @@ class Codegen:
         return result
 
     def gen_mat4_scale(self, node):
-        """mat4_scale(x, y, z) — a matrix that scales a point's x/y/z
-        components by these factors when multiplied with it."""
         if len(node.args) != 3:
             raise Exception("mat4_scale(x, y, z) expects 3 numbers")
-
         result = self.identity_mat4_constant()
         for i, arg in enumerate(node.args):
             val = self.to_float(self.gen_expr(arg))
@@ -814,19 +1014,12 @@ class Codegen:
         return result
 
     def sincos(self, angle):
-        """Returns (sin(angle), cos(angle)) as doubles, computed via the
-        llvm.sin.f64/llvm.cos.f64 intrinsics declared in setup_printf."""
         angle = self.to_float(angle)
         s = self.builder.call(self.llvm_sin, [angle])
         c = self.builder.call(self.llvm_cos, [angle])
         return s, c
 
     def build_mat4_from_rows(self, rows):
-        """Builds a constant-shaped mat4 IR value, lane by lane, from 4
-        lists of 4 scalar IR values each (row-major) — used by the
-        rotation matrices, whose entries are runtime sin/cos values and
-        so can't be folded into an ir.Constant the way identity/translate/
-        scale's mostly-constant entries can."""
         result = ir.Constant(MAT4_TYPE, ir.Undefined)
         for i, row_vals in enumerate(rows):
             row = ir.Constant(VECTOR_TYPES["vec4"], ir.Undefined)
@@ -836,16 +1029,12 @@ class Codegen:
         return result
 
     def gen_mat4_rotate_x(self, node):
-        """mat4_rotate_x(angle) — rotates around the X axis by `angle`
-        radians (right-handed: Y rotates toward Z). X is left fixed."""
         if len(node.args) != 1:
             raise Exception("mat4_rotate_x(angle) expects 1 argument")
-
         s, c = self.sincos(self.gen_expr(node.args[0]))
         zero = ir.Constant(float_type, 0.0)
         one  = ir.Constant(float_type, 1.0)
         neg_s = self.builder.fneg(s)
-
         rows = [
             [one,  zero, zero,  zero],
             [zero, c,    neg_s, zero],
@@ -855,16 +1044,12 @@ class Codegen:
         return self.build_mat4_from_rows(rows)
 
     def gen_mat4_rotate_y(self, node):
-        """mat4_rotate_y(angle) — rotates around the Y axis by `angle`
-        radians (right-handed: Z rotates toward X). Y is left fixed."""
         if len(node.args) != 1:
             raise Exception("mat4_rotate_y(angle) expects 1 argument")
-
         s, c = self.sincos(self.gen_expr(node.args[0]))
         zero = ir.Constant(float_type, 0.0)
         one  = ir.Constant(float_type, 1.0)
         neg_s = self.builder.fneg(s)
-
         rows = [
             [c,    zero, s,    zero],
             [zero, one,  zero, zero],
@@ -874,16 +1059,12 @@ class Codegen:
         return self.build_mat4_from_rows(rows)
 
     def gen_mat4_rotate_z(self, node):
-        """mat4_rotate_z(angle) — rotates around the Z axis by `angle`
-        radians (right-handed: X rotates toward Y). Z is left fixed."""
         if len(node.args) != 1:
             raise Exception("mat4_rotate_z(angle) expects 1 argument")
-
         s, c = self.sincos(self.gen_expr(node.args[0]))
         zero = ir.Constant(float_type, 0.0)
         one  = ir.Constant(float_type, 1.0)
         neg_s = self.builder.fneg(s)
-
         rows = [
             [c,   neg_s, zero, zero],
             [s,   c,     zero, zero],
@@ -893,7 +1074,6 @@ class Codegen:
         return self.build_mat4_from_rows(rows)
 
     def gen_dot(self, a, b):
-        """Dot product of two same-size vectors -> a single double."""
         prod  = self.builder.fmul(a, b)
         size  = a.type.count
         total = self.builder.extract_element(prod, ir.Constant(ir.IntType(32), 0))
@@ -903,8 +1083,6 @@ class Codegen:
         return total
 
     def gen_mat4_vec_mul(self, m, v):
-        """mat4 * vec4 -> vec4 — transforms a point/direction by a matrix.
-        Each output component is the dot product of a matrix row with v."""
         result = ir.Constant(VECTOR_TYPES["vec4"], ir.Undefined)
         for i in range(4):
             row = self.builder.extract_value(m, i)
@@ -913,9 +1091,6 @@ class Codegen:
         return result
 
     def gen_mat4_mat_mul(self, m1, m2):
-        """mat4 * mat4 -> mat4 — combines two transforms. result[i][j] is
-        the dot product of m1's row i with m2's column j."""
-        # Gather m2's columns first (m2 is stored as rows).
         cols = []
         for j in range(4):
             col = ir.Constant(VECTOR_TYPES["vec4"], ir.Undefined)
@@ -924,7 +1099,6 @@ class Codegen:
                 elem  = self.builder.extract_element(row_i, ir.Constant(ir.IntType(32), j))
                 col   = self.builder.insert_element(col, elem, ir.Constant(ir.IntType(32), i))
             cols.append(col)
-
         result = ir.Constant(MAT4_TYPE, ir.Undefined)
         for i in range(4):
             row_i      = self.builder.extract_value(m1, i)
@@ -938,10 +1112,8 @@ class Codegen:
     def gen_mat4_binop(self, left, right, op):
         if op != "*":
             raise Exception(f"mat4 only supports '*' (got '{op}')")
-
         if left.type == MAT4_TYPE and right.type == MAT4_TYPE:
             return self.gen_mat4_mat_mul(left, right)
         if left.type == MAT4_TYPE and right.type == VECTOR_TYPES["vec4"]:
             return self.gen_mat4_vec_mul(left, right)
-
         raise Exception("mat4 can be multiplied with another mat4, or with a vec4")

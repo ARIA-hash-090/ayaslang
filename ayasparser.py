@@ -94,7 +94,7 @@ class FunNode:
     def __init__(self, name, params, param_types, body):
         self.name        = name
         self.params      = params
-        self.param_types = param_types  # parallel list: type name string or None
+        self.param_types = param_types
         self.body        = body
     def __repr__(self):
         return f"Fun({self.name}({', '.join(self.params)}), {len(self.body)} statements)"
@@ -112,12 +112,7 @@ class GiveBackNode:
     def __repr__(self):
         return f"GiveBack({self.value})"
 
-
 class ThingNode:
-    """A struct definition: `thing Point { x: float y: float z: float }`.
-    fields/field_types are parallel lists, like FunNode's params/param_types,
-    but every field MUST have a type annotation (there's no value yet to
-    infer from — a thing definition just describes a shape)."""
     def __init__(self, name, fields, field_types):
         self.name        = name
         self.fields      = fields
@@ -126,7 +121,6 @@ class ThingNode:
         return f"Thing({self.name}, {self.fields})"
 
 class FieldAccessNode:
-    """Reading a field off a struct instance: `enemy.x`."""
     def __init__(self, name, field):
         self.name  = name
         self.field = field
@@ -134,13 +128,41 @@ class FieldAccessNode:
         return f"FieldAccess({self.name}.{self.field})"
 
 class FieldAssignNode:
-    """Writing a field on a struct instance: `enemy.x be 20.0`."""
     def __init__(self, name, field, value):
         self.name  = name
         self.field = field
         self.value = value
     def __repr__(self):
         return f"FieldAssign({self.name}.{self.field} = {self.value})"
+
+class ArrayLiteralNode:
+    def __init__(self, elements):
+        self.elements = elements
+    def __repr__(self):
+        return f"ArrayLiteral({self.elements})"
+
+class IndexAccessNode:
+    def __init__(self, name, index):
+        self.name  = name
+        self.index = index
+    def __repr__(self):
+        return f"IndexAccess({self.name}[{self.index}])"
+
+class IndexAssignNode:
+    def __init__(self, name, index, value):
+        self.name  = name
+        self.index = index
+        self.value = value
+    def __repr__(self):
+        return f"IndexAssign({self.name}[{self.index}] = {self.value})"
+
+class MethodCallNode:
+    def __init__(self, name, method, args):
+        self.name   = name
+        self.method = method
+        self.args   = args
+    def __repr__(self):
+        return f"MethodCall({self.name}.{self.method}({self.args}))"
 
 
 class Parser:
@@ -189,7 +211,9 @@ class Parser:
         elif token.type == TokenType.LET:
             return self.parse_let()
         elif token.type == TokenType.IDENTIFIER and self.peek() and self.peek().type == TokenType.DOT:
-            return self.parse_field_assign()
+            return self.parse_dot_statement()
+        elif token.type == TokenType.IDENTIFIER and self.peek() and self.peek().type == TokenType.LBRACKET:
+            return self.parse_index_assign()
         elif token.type == TokenType.IDENTIFIER and self.peek() and self.peek().type == TokenType.BE:
             return self.parse_assign()
         elif token.type == TokenType.IDENTIFIER and self.peek() and self.peek().type == TokenType.LPAREN:
@@ -209,12 +233,6 @@ class Parser:
             raise Exception(f"Unexpected token {token.type} on line {token.line}")
 
     def parse_thing(self):
-        """thing Point {
-               x: float
-               y: float
-           }
-        Every field needs a `: type` annotation — unlike function params,
-        there's no value to infer a type from at definition time."""
         self.expect(TokenType.THING)
         name = self.expect(TokenType.IDENTIFIER).value
         self.skip_newlines()
@@ -234,14 +252,33 @@ class Parser:
         self.expect(TokenType.RBRACE)
         return ThingNode(name, fields, field_types)
 
-    def parse_field_assign(self):
-        """enemy.x be 20.0"""
-        name = self.expect(TokenType.IDENTIFIER).value
+    def parse_dot_statement(self):
+        name  = self.expect(TokenType.IDENTIFIER).value
         self.expect(TokenType.DOT)
         field = self.expect(TokenType.IDENTIFIER).value
+        if self.current().type == TokenType.LPAREN:
+            self.expect(TokenType.LPAREN)
+            args = []
+            if self.current().type != TokenType.RPAREN:
+                args.append(self.parse_expression())
+                while self.current().type == TokenType.COMMA:
+                    self.advance()
+                    args.append(self.parse_expression())
+            self.expect(TokenType.RPAREN)
+            return MethodCallNode(name, field, args)
+        else:
+            self.expect(TokenType.BE)
+            value = self.parse_expression()
+            return FieldAssignNode(name, field, value)
+
+    def parse_index_assign(self):
+        name = self.expect(TokenType.IDENTIFIER).value
+        self.expect(TokenType.LBRACKET)
+        index = self.parse_expression()
+        self.expect(TokenType.RBRACKET)
         self.expect(TokenType.BE)
         value = self.parse_expression()
-        return FieldAssignNode(name, field, value)
+        return IndexAssignNode(name, index, value)
 
     def parse_let(self):
         self.expect(TokenType.LET)
@@ -308,7 +345,7 @@ class Parser:
             body = self.parse_block()
             return RepeatInNode(var_name, start, end, body)
 
-        raise Exception(f"Unsupported 'repeat' form on line {self.current().line} (expected 'repeat <number> times' or 'repeat <name> in [<start> to <end>]')")
+        raise Exception(f"Unsupported 'repeat' form on line {self.current().line}")
 
     def parse_fun(self):
         self.expect(TokenType.FUN)
@@ -330,9 +367,6 @@ class Parser:
         return FunNode(name, params, param_types, body)
 
     def parse_optional_type(self):
-        """Parses an optional ': vec3' / ': float' etc. after a parameter
-        name. Returns the type name as a string, or None if there's no
-        annotation (in which case the parameter defaults to a number)."""
         if self.current().type == TokenType.COLON:
             self.advance()
             return self.expect(TokenType.IDENTIFIER).value
@@ -340,14 +374,12 @@ class Parser:
 
     def parse_call(self, name):
         self.expect(TokenType.LPAREN)
-
         args = []
         if self.current().type != TokenType.RPAREN:
             args.append(self.parse_expression())
             while self.current().type == TokenType.COMMA:
                 self.advance()
                 args.append(self.parse_expression())
-
         self.expect(TokenType.RPAREN)
         return CallNode(name, args)
 
@@ -396,14 +428,24 @@ class Parser:
     def parse_expression(self):
         if self.current().type == TokenType.LBRACKET:
             self.advance()
-            left = self.parse_primary()
             if self.current().type == TokenType.RBRACKET:
                 self.advance()
-                return left
+                return ArrayLiteralNode([])
+            first = self.parse_primary()
+            if self.current().type == TokenType.RBRACKET:
+                self.advance()
+                return first
+            if self.current().type == TokenType.COMMA:
+                elements = [first]
+                while self.current().type == TokenType.COMMA:
+                    self.advance()
+                    elements.append(self.parse_primary())
+                self.expect(TokenType.RBRACKET)
+                return ArrayLiteralNode(elements)
             op    = self.advance().value
             right = self.parse_primary()
             self.expect(TokenType.RBRACKET)
-            return BinaryOpNode(left, op, right)
+            return BinaryOpNode(first, op, right)
         return self.parse_primary()
 
     def parse_primary(self):
@@ -428,7 +470,22 @@ class Parser:
             if self.current().type == TokenType.DOT:
                 self.advance()
                 field = self.expect(TokenType.IDENTIFIER).value
+                if self.current().type == TokenType.LPAREN:
+                    self.expect(TokenType.LPAREN)
+                    args = []
+                    if self.current().type != TokenType.RPAREN:
+                        args.append(self.parse_expression())
+                        while self.current().type == TokenType.COMMA:
+                            self.advance()
+                            args.append(self.parse_expression())
+                    self.expect(TokenType.RPAREN)
+                    return MethodCallNode(token.value, field, args)
                 return FieldAccessNode(token.value, field)
+            if self.current().type == TokenType.LBRACKET:
+                self.advance()
+                index = self.parse_expression()
+                self.expect(TokenType.RBRACKET)
+                return IndexAccessNode(token.value, index)
             return IdentifierNode(token.value)
         else:
             raise Exception(f"Unexpected token {token.type} on line {token.line}")

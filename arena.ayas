@@ -1,0 +1,13 @@
+let p be arena_alloc(8)
+poke_i64(p, 42)
+show peek_i64(p)
+
+let q be arena_alloc(8)
+poke_i64(q, 99)
+show peek_i64(q)
+show peek_i64(p)
+
+arena_reset()
+let r be arena_alloc(8)
+poke_i64(r, 7)
+show peek_i64(r)

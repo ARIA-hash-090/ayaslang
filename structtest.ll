@@ -10,124 +10,137 @@ declare double @"llvm.sin.f64"(double %".1")
 
 declare double @"llvm.cos.f64"(double %".1")
 
+declare i8* @"malloc"(i64 %".1")
+
+declare void @"free"(i8* %".1")
+
+@"ayas_arena_buf" = internal global i8* null
+@"ayas_arena_offset" = internal global i64 0
+declare void @"llvm.memcpy.p0i8.p0i8.i64"(i8* %".1", i8* %".2", i64 %".3", i1 %".4")
+
 define i32 @"main"()
 {
 entry:
-  %".2" = insertvalue {double, double, i64} undef, double 0x4014000000000000, 0
-  %".3" = insertvalue {double, double, i64} %".2", double 0x4024000000000000, 1
-  %".4" = insertvalue {double, double, i64} %".3", i64 100, 2
+  %".2" = call i8* @"malloc"(i64 1048576)
+  store i8* %".2", i8** @"ayas_arena_buf"
+  store i64 0, i64* @"ayas_arena_offset"
+  %".5" = insertvalue {double, double, i64} undef, double 0x4014000000000000, 0
+  %".6" = insertvalue {double, double, i64} %".5", double 0x4024000000000000, 1
+  %".7" = insertvalue {double, double, i64} %".6", i64 100, 2
   %"bad_guy" = alloca {double, double, i64}, align 16
-  store {double, double, i64} %".4", {double, double, i64}* %"bad_guy"
+  store {double, double, i64} %".7", {double, double, i64}* %"bad_guy"
   %"bad_guy.1" = load {double, double, i64}, {double, double, i64}* %"bad_guy"
-  %".6" = extractvalue {double, double, i64} %"bad_guy.1", 0
-  %".7" = fcmp olt double %".6",              0x0
-  br i1 %".7", label %"entry.if", label %"entry.endif"
+  %".9" = extractvalue {double, double, i64} %"bad_guy.1", 0
+  %".10" = fcmp olt double %".9",              0x0
+  br i1 %".10", label %"entry.if", label %"entry.endif"
 entry.if:
-  %".9" = bitcast [2 x i8]* @"str_minus" to i8*
-  %".10" = call i32 (i8*, ...) @"printf"(i8* %".9")
-  %".11" = call i32 @"fflush"(i8* null)
+  %".12" = bitcast [2 x i8]* @"str_minus" to i8*
+  %".13" = call i32 (i8*, ...) @"printf"(i8* %".12")
+  %".14" = call i32 @"fflush"(i8* null)
   br label %"entry.endif"
 entry.endif:
-  %".13" = fneg double %".6"
-  %".14" = select  i1 %".7", double %".13", double %".6"
-  %".15" = fptosi double %".14" to i64
-  %".16" = sitofp i64 %".15" to double
-  %".17" = fsub double %".14", %".16"
-  %".18" = fmul double %".17", 0x40c3880000000000
-  %".19" = fadd double %".18", 0x3fe0000000000000
-  %".20" = fptosi double %".19" to i64
-  %".21" = icmp sge i64 %".20", 10000
-  %".22" = add i64 %".15", 1
-  %".23" = select  i1 %".21", i64 %".22", i64 %".15"
-  %".24" = select  i1 %".21", i64 0, i64 %".20"
-  %".25" = bitcast [6 x i8]* @"fmt_int_plain" to i8*
-  %".26" = call i32 (i8*, ...) @"printf"(i8* %".25", i64 %".23")
-  %".27" = call i32 @"fflush"(i8* null)
-  %".28" = bitcast [2 x i8]* @"str_dot" to i8*
-  %".29" = call i32 (i8*, ...) @"printf"(i8* %".28")
+  %".16" = fneg double %".9"
+  %".17" = select  i1 %".10", double %".16", double %".9"
+  %".18" = fptosi double %".17" to i64
+  %".19" = sitofp i64 %".18" to double
+  %".20" = fsub double %".17", %".19"
+  %".21" = fmul double %".20", 0x40c3880000000000
+  %".22" = fadd double %".21", 0x3fe0000000000000
+  %".23" = fptosi double %".22" to i64
+  %".24" = icmp sge i64 %".23", 10000
+  %".25" = add i64 %".18", 1
+  %".26" = select  i1 %".24", i64 %".25", i64 %".18"
+  %".27" = select  i1 %".24", i64 0, i64 %".23"
+  %".28" = bitcast [6 x i8]* @"fmt_int_plain" to i8*
+  %".29" = call i32 (i8*, ...) @"printf"(i8* %".28", i64 %".26")
   %".30" = call i32 @"fflush"(i8* null)
-  %".31" = bitcast [8 x i8]* @"fmt_frac" to i8*
-  %".32" = call i32 (i8*, ...) @"printf"(i8* %".31", i64 %".24")
+  %".31" = bitcast [2 x i8]* @"str_dot" to i8*
+  %".32" = call i32 (i8*, ...) @"printf"(i8* %".31")
   %".33" = call i32 @"fflush"(i8* null)
-  %".34" = bitcast [2 x i8]* @"str_newline" to i8*
-  %".35" = call i32 (i8*, ...) @"printf"(i8* %".34")
+  %".34" = bitcast [8 x i8]* @"fmt_frac" to i8*
+  %".35" = call i32 (i8*, ...) @"printf"(i8* %".34", i64 %".27")
   %".36" = call i32 @"fflush"(i8* null)
+  %".37" = bitcast [2 x i8]* @"str_newline" to i8*
+  %".38" = call i32 (i8*, ...) @"printf"(i8* %".37")
+  %".39" = call i32 @"fflush"(i8* null)
   %"bad_guy.2" = load {double, double, i64}, {double, double, i64}* %"bad_guy"
-  %".37" = extractvalue {double, double, i64} %"bad_guy.2", 1
-  %".38" = fcmp olt double %".37",              0x0
-  br i1 %".38", label %"entry.endif.if", label %"entry.endif.endif"
+  %".40" = extractvalue {double, double, i64} %"bad_guy.2", 1
+  %".41" = fcmp olt double %".40",              0x0
+  br i1 %".41", label %"entry.endif.if", label %"entry.endif.endif"
 entry.endif.if:
-  %".40" = bitcast [2 x i8]* @"str_minus" to i8*
-  %".41" = call i32 (i8*, ...) @"printf"(i8* %".40")
-  %".42" = call i32 @"fflush"(i8* null)
+  %".43" = bitcast [2 x i8]* @"str_minus" to i8*
+  %".44" = call i32 (i8*, ...) @"printf"(i8* %".43")
+  %".45" = call i32 @"fflush"(i8* null)
   br label %"entry.endif.endif"
 entry.endif.endif:
-  %".44" = fneg double %".37"
-  %".45" = select  i1 %".38", double %".44", double %".37"
-  %".46" = fptosi double %".45" to i64
-  %".47" = sitofp i64 %".46" to double
-  %".48" = fsub double %".45", %".47"
-  %".49" = fmul double %".48", 0x40c3880000000000
-  %".50" = fadd double %".49", 0x3fe0000000000000
-  %".51" = fptosi double %".50" to i64
-  %".52" = icmp sge i64 %".51", 10000
-  %".53" = add i64 %".46", 1
-  %".54" = select  i1 %".52", i64 %".53", i64 %".46"
-  %".55" = select  i1 %".52", i64 0, i64 %".51"
-  %".56" = bitcast [6 x i8]* @"fmt_int_plain" to i8*
-  %".57" = call i32 (i8*, ...) @"printf"(i8* %".56", i64 %".54")
-  %".58" = call i32 @"fflush"(i8* null)
-  %".59" = bitcast [2 x i8]* @"str_dot" to i8*
-  %".60" = call i32 (i8*, ...) @"printf"(i8* %".59")
+  %".47" = fneg double %".40"
+  %".48" = select  i1 %".41", double %".47", double %".40"
+  %".49" = fptosi double %".48" to i64
+  %".50" = sitofp i64 %".49" to double
+  %".51" = fsub double %".48", %".50"
+  %".52" = fmul double %".51", 0x40c3880000000000
+  %".53" = fadd double %".52", 0x3fe0000000000000
+  %".54" = fptosi double %".53" to i64
+  %".55" = icmp sge i64 %".54", 10000
+  %".56" = add i64 %".49", 1
+  %".57" = select  i1 %".55", i64 %".56", i64 %".49"
+  %".58" = select  i1 %".55", i64 0, i64 %".54"
+  %".59" = bitcast [6 x i8]* @"fmt_int_plain" to i8*
+  %".60" = call i32 (i8*, ...) @"printf"(i8* %".59", i64 %".57")
   %".61" = call i32 @"fflush"(i8* null)
-  %".62" = bitcast [8 x i8]* @"fmt_frac" to i8*
-  %".63" = call i32 (i8*, ...) @"printf"(i8* %".62", i64 %".55")
+  %".62" = bitcast [2 x i8]* @"str_dot" to i8*
+  %".63" = call i32 (i8*, ...) @"printf"(i8* %".62")
   %".64" = call i32 @"fflush"(i8* null)
-  %".65" = bitcast [2 x i8]* @"str_newline" to i8*
-  %".66" = call i32 (i8*, ...) @"printf"(i8* %".65")
+  %".65" = bitcast [8 x i8]* @"fmt_frac" to i8*
+  %".66" = call i32 (i8*, ...) @"printf"(i8* %".65", i64 %".58")
   %".67" = call i32 @"fflush"(i8* null)
+  %".68" = bitcast [2 x i8]* @"str_newline" to i8*
+  %".69" = call i32 (i8*, ...) @"printf"(i8* %".68")
+  %".70" = call i32 @"fflush"(i8* null)
   %"bad_guy.3" = load {double, double, i64}, {double, double, i64}* %"bad_guy"
-  %".68" = extractvalue {double, double, i64} %"bad_guy.3", 2
-  %".69" = bitcast [7 x i8]* @"fmt_int" to i8*
-  %".70" = call i32 (i8*, ...) @"printf"(i8* %".69", i64 %".68")
-  %".71" = call i32 @"fflush"(i8* null)
+  %".71" = extractvalue {double, double, i64} %"bad_guy.3", 2
+  %".72" = bitcast [7 x i8]* @"fmt_int" to i8*
+  %".73" = call i32 (i8*, ...) @"printf"(i8* %".72", i64 %".71")
+  %".74" = call i32 @"fflush"(i8* null)
   %"bad_guy.4" = load {double, double, i64}, {double, double, i64}* %"bad_guy"
-  %".72" = insertvalue {double, double, i64} %"bad_guy.4", double 0x4034000000000000, 0
-  store {double, double, i64} %".72", {double, double, i64}* %"bad_guy"
+  %".75" = insertvalue {double, double, i64} %"bad_guy.4", double 0x4034000000000000, 0
+  store {double, double, i64} %".75", {double, double, i64}* %"bad_guy"
   %"bad_guy.5" = load {double, double, i64}, {double, double, i64}* %"bad_guy"
-  %".74" = extractvalue {double, double, i64} %"bad_guy.5", 0
-  %".75" = fcmp olt double %".74",              0x0
-  br i1 %".75", label %"entry.endif.endif.if", label %"entry.endif.endif.endif"
+  %".77" = extractvalue {double, double, i64} %"bad_guy.5", 0
+  %".78" = fcmp olt double %".77",              0x0
+  br i1 %".78", label %"entry.endif.endif.if", label %"entry.endif.endif.endif"
 entry.endif.endif.if:
-  %".77" = bitcast [2 x i8]* @"str_minus" to i8*
-  %".78" = call i32 (i8*, ...) @"printf"(i8* %".77")
-  %".79" = call i32 @"fflush"(i8* null)
+  %".80" = bitcast [2 x i8]* @"str_minus" to i8*
+  %".81" = call i32 (i8*, ...) @"printf"(i8* %".80")
+  %".82" = call i32 @"fflush"(i8* null)
   br label %"entry.endif.endif.endif"
 entry.endif.endif.endif:
-  %".81" = fneg double %".74"
-  %".82" = select  i1 %".75", double %".81", double %".74"
-  %".83" = fptosi double %".82" to i64
-  %".84" = sitofp i64 %".83" to double
-  %".85" = fsub double %".82", %".84"
-  %".86" = fmul double %".85", 0x40c3880000000000
-  %".87" = fadd double %".86", 0x3fe0000000000000
-  %".88" = fptosi double %".87" to i64
-  %".89" = icmp sge i64 %".88", 10000
-  %".90" = add i64 %".83", 1
-  %".91" = select  i1 %".89", i64 %".90", i64 %".83"
-  %".92" = select  i1 %".89", i64 0, i64 %".88"
-  %".93" = bitcast [6 x i8]* @"fmt_int_plain" to i8*
-  %".94" = call i32 (i8*, ...) @"printf"(i8* %".93", i64 %".91")
-  %".95" = call i32 @"fflush"(i8* null)
-  %".96" = bitcast [2 x i8]* @"str_dot" to i8*
-  %".97" = call i32 (i8*, ...) @"printf"(i8* %".96")
+  %".84" = fneg double %".77"
+  %".85" = select  i1 %".78", double %".84", double %".77"
+  %".86" = fptosi double %".85" to i64
+  %".87" = sitofp i64 %".86" to double
+  %".88" = fsub double %".85", %".87"
+  %".89" = fmul double %".88", 0x40c3880000000000
+  %".90" = fadd double %".89", 0x3fe0000000000000
+  %".91" = fptosi double %".90" to i64
+  %".92" = icmp sge i64 %".91", 10000
+  %".93" = add i64 %".86", 1
+  %".94" = select  i1 %".92", i64 %".93", i64 %".86"
+  %".95" = select  i1 %".92", i64 0, i64 %".91"
+  %".96" = bitcast [6 x i8]* @"fmt_int_plain" to i8*
+  %".97" = call i32 (i8*, ...) @"printf"(i8* %".96", i64 %".94")
   %".98" = call i32 @"fflush"(i8* null)
-  %".99" = bitcast [8 x i8]* @"fmt_frac" to i8*
-  %".100" = call i32 (i8*, ...) @"printf"(i8* %".99", i64 %".92")
+  %".99" = bitcast [2 x i8]* @"str_dot" to i8*
+  %".100" = call i32 (i8*, ...) @"printf"(i8* %".99")
   %".101" = call i32 @"fflush"(i8* null)
-  %".102" = bitcast [2 x i8]* @"str_newline" to i8*
-  %".103" = call i32 (i8*, ...) @"printf"(i8* %".102")
+  %".102" = bitcast [8 x i8]* @"fmt_frac" to i8*
+  %".103" = call i32 (i8*, ...) @"printf"(i8* %".102", i64 %".95")
   %".104" = call i32 @"fflush"(i8* null)
+  %".105" = bitcast [2 x i8]* @"str_newline" to i8*
+  %".106" = call i32 (i8*, ...) @"printf"(i8* %".105")
+  %".107" = call i32 @"fflush"(i8* null)
+  %".108" = load i8*, i8** @"ayas_arena_buf"
+  call void @"free"(i8* %".108")
   ret i32 0
 }
 
