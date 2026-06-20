@@ -5,7 +5,8 @@ from ayasparser import (NumberNode, FloatNode, StringNode, IdentifierNode,
                         FunNode, CallNode, GiveBackNode,
                         ThingNode, FieldAccessNode, FieldAssignNode,
                         ArrayLiteralNode, IndexAccessNode, IndexAssignNode,
-                        MethodCallNode)
+                        MethodCallNode, FailNode,
+                        AndNode, OrNode)
 
 int_type   = ir.IntType(64)
 float_type = ir.DoubleType()
@@ -40,6 +41,8 @@ class Codegen:
         self.module          = ir.Module(name="ayas")
         self.builder         = None
         self.vars            = {}
+        self.global_vars     = {}
+        self.in_main         = False
         self.functions       = {}
         self.things          = {}
         self.var_thing_types = {}
@@ -65,6 +68,21 @@ class Codegen:
         trig_ty   = ir.FunctionType(float_type, [float_type])
         self.llvm_sin = ir.Function(self.module, trig_ty, name="llvm.sin.f64")
         self.llvm_cos = ir.Function(self.module, trig_ty, name="llvm.cos.f64")
+        # File I/O — libc wrappers
+        fopen_ty        = ir.FunctionType(voidptr_ty, [voidptr_ty, voidptr_ty])
+        self.fopen      = ir.Function(self.module, fopen_ty,  name="fopen")
+        fclose_ty       = ir.FunctionType(ir.IntType(32), [voidptr_ty])
+        self.fclose     = ir.Function(self.module, fclose_ty, name="fclose")
+        fread_ty        = ir.FunctionType(int_type, [voidptr_ty, int_type, int_type, voidptr_ty])
+        self.fread      = ir.Function(self.module, fread_ty,  name="fread")
+        fwrite_ty       = ir.FunctionType(int_type, [voidptr_ty, int_type, int_type, voidptr_ty])
+        self.fwrite     = ir.Function(self.module, fwrite_ty, name="fwrite")
+        fseek_ty        = ir.FunctionType(ir.IntType(32), [voidptr_ty, int_type, ir.IntType(32)])
+        self.fseek      = ir.Function(self.module, fseek_ty,  name="fseek")
+        ftell_ty        = ir.FunctionType(int_type, [voidptr_ty])
+        self.ftell      = ir.Function(self.module, ftell_ty,  name="ftell")
+        strlen_ty       = ir.FunctionType(int_type, [voidptr_ty])
+        self.strlen     = ir.Function(self.module, strlen_ty, name="strlen")
 
     ARENA_CAPACITY_BYTES = 1024 * 1024
 
@@ -97,6 +115,197 @@ class Codegen:
     def gen_arena_shutdown(self):
         buf = self.builder.load(self.arena_buf_global)
         self.builder.call(self.free, [buf])
+
+    # ------------------------------------------------------------------
+    # String character builtins
+    # ------------------------------------------------------------------
+
+    def gen_char_at(self, node):
+        """char_at(str, index) -> ASCII value of character at index (i64)."""
+        if len(node.args) != 2:
+            raise Exception("char_at(str, index) expects 2 arguments")
+        s   = self.gen_expr(node.args[0])
+        idx = self.gen_expr(node.args[1])
+        ptr = self.builder.gep(s, [idx])
+        ch  = self.builder.load(ptr)
+        return self.builder.zext(ch, int_type)
+
+    def gen_str_len(self, node):
+        """str_len(str) -> length of string (i64)."""
+        if len(node.args) != 1:
+            raise Exception("str_len(str) expects 1 argument")
+        s = self.gen_expr(node.args[0])
+        return self.builder.call(self.strlen, [s])
+
+    def gen_char_code(self, node):
+        """char_code("x") -> ASCII value of first character (i64)."""
+        if len(node.args) != 1:
+            raise Exception("char_code(char) expects 1 argument")
+        arg = node.args[0]
+        from ayasparser import StringNode
+        if not isinstance(arg, StringNode):
+            raise Exception("char_code() expects a string literal")
+        if len(arg.value) == 0:
+            raise Exception("char_code() expects a non-empty string")
+        return ir.Constant(int_type, ord(arg.value[0]))
+
+    # ------------------------------------------------------------------
+    # String building builtins
+    # ------------------------------------------------------------------
+
+    def gen_make_str(self, node):
+        """make_str(capacity) -> i8* to a zeroed arena block."""
+        if len(node.args) != 1:
+            raise Exception("make_str(capacity) expects 1 argument")
+        cap        = self.gen_expr(node.args[0])
+        offset     = self.builder.load(self.arena_offset_global)
+        buf        = self.builder.load(self.arena_buf_global)
+        new_offset = self.builder.add(offset, cap)
+        self.builder.store(new_offset, self.arena_offset_global)
+        ptr = self.builder.gep(buf, [offset])
+        self.builder.store(ir.Constant(ir.IntType(8), 0), ptr)
+        return ptr
+
+    def gen_str_append_char(self, node):
+        """str_append_char(buf, char_code) — append one byte to a null-terminated buffer."""
+        if len(node.args) != 2:
+            raise Exception("str_append_char(buf, char_code) expects 2 arguments")
+        buf      = self.gen_expr(node.args[0])
+        code     = self.gen_expr(node.args[1])
+        length   = self.builder.call(self.strlen, [buf])
+        end_ptr  = self.builder.gep(buf, [length])
+        ch       = self.builder.trunc(code, ir.IntType(8))
+        self.builder.store(ch, end_ptr)
+        one      = ir.Constant(int_type, 1)
+        next_ptr = self.builder.gep(buf, [self.builder.add(length, one)])
+        self.builder.store(ir.Constant(ir.IntType(8), 0), next_ptr)
+        return ir.Constant(int_type, 0)
+
+    def gen_str_eq(self, node):
+        """str_eq(s1, s2) -> 1 if equal, 0 otherwise."""
+        if len(node.args) != 2:
+            raise Exception("str_eq(s1, s2) expects 2 arguments")
+        s1 = self.gen_expr(node.args[0])
+        s2 = self.gen_expr(node.args[1])
+        if "strcmp" not in self.module.globals:
+            strcmp_ty   = ir.FunctionType(ir.IntType(32), [self.voidptr_ty, self.voidptr_ty])
+            self.strcmp = ir.Function(self.module, strcmp_ty, name="strcmp")
+        else:
+            self.strcmp = self.module.globals["strcmp"]
+        result   = self.builder.call(self.strcmp, [s1, s2])
+        is_equal = self.builder.icmp_signed("==", result, ir.Constant(ir.IntType(32), 0))
+        return self.builder.zext(is_equal, int_type)
+
+    def gen_str_concat(self, node):
+        """str_concat(s1, s2) -> new arena string with s1 and s2 joined."""
+        if len(node.args) != 2:
+            raise Exception("str_concat(s1, s2) expects 2 arguments")
+        s1  = self.gen_expr(node.args[0])
+        s2  = self.gen_expr(node.args[1])
+        l1  = self.builder.call(self.strlen, [s1])
+        l2  = self.builder.call(self.strlen, [s2])
+        # total = l1 + l2 + 1 (null terminator)
+        total = self.builder.add(self.builder.add(l1, l2), ir.Constant(int_type, 1))
+        # allocate from arena
+        offset     = self.builder.load(self.arena_offset_global)
+        buf        = self.builder.load(self.arena_buf_global)
+        new_offset = self.builder.add(offset, total)
+        self.builder.store(new_offset, self.arena_offset_global)
+        dest = self.builder.gep(buf, [offset])
+        # memcpy s1 into dest
+        false = ir.Constant(bool_type, 0)
+        self.builder.call(self.llvm_memcpy, [dest, s1, l1, false])
+        # memcpy s2 into dest + l1
+        dest2 = self.builder.gep(dest, [l1])
+        self.builder.call(self.llvm_memcpy, [dest2, s2, l2, false])
+        # null terminate
+        end_ptr = self.builder.gep(dest, [self.builder.add(l1, l2)])
+        self.builder.store(ir.Constant(ir.IntType(8), 0), end_ptr)
+        return dest
+
+    # ------------------------------------------------------------------
+    # File I/O builtins
+    # ------------------------------------------------------------------
+
+    def gen_open_file(self, node):
+        """open_file(path) -> file handle (i8*). skill issue if not found."""
+        if len(node.args) != 1:
+            raise Exception("open_file(path) expects 1 argument")
+        path = self.gen_expr(node.args[0])
+        mode = self.get_global_string("rb", "str_mode_r")
+        handle = self.builder.call(self.fopen, [path, mode])
+        # Check for NULL — file not found
+        null = ir.Constant(self.voidptr_ty, None)
+        is_null = self.builder.icmp_unsigned("==", handle, null)
+        fail_block = self.builder.append_basic_block("open_fail")
+        ok_block   = self.builder.append_basic_block("open_ok")
+        self.builder.cbranch(is_null, fail_block, ok_block)
+        # Fail branch — skill issue
+        self.builder.position_at_end(fail_block)
+        self.print_text("skill issue: could not open file\n", "str_open_fail")
+        self.builder.ret(ir.Constant(ir.IntType(32), 1))
+        # OK branch
+        self.builder.position_at_end(ok_block)
+        return handle
+
+    def gen_open_file_write(self, node):
+        """open_file_write(path) -> file handle (i8*). skill issue if failed."""
+        if len(node.args) != 1:
+            raise Exception("open_file_write(path) expects 1 argument")
+        path = self.gen_expr(node.args[0])
+        mode = self.get_global_string("w", "str_mode_w")
+        handle = self.builder.call(self.fopen, [path, mode])
+        null = ir.Constant(self.voidptr_ty, None)
+        is_null = self.builder.icmp_unsigned("==", handle, null)
+        fail_block = self.builder.append_basic_block("openw_fail")
+        ok_block   = self.builder.append_basic_block("openw_ok")
+        self.builder.cbranch(is_null, fail_block, ok_block)
+        self.builder.position_at_end(fail_block)
+        self.print_text("skill issue: could not open file for writing\n", "str_openw_fail")
+        self.builder.ret(ir.Constant(ir.IntType(32), 1))
+        self.builder.position_at_end(ok_block)
+        return handle
+
+    def gen_read_file(self, node):
+        """read_file(handle) -> string (i8*) containing entire file contents."""
+        if len(node.args) != 1:
+            raise Exception("read_file(handle) expects 1 argument")
+        handle = self.gen_expr(node.args[0])
+        # Seek to end to get file size
+        seek_end = ir.Constant(ir.IntType(32), 2)   # SEEK_END = 2
+        seek_set = ir.Constant(ir.IntType(32), 0)   # SEEK_SET = 0
+        self.builder.call(self.fseek, [handle, ir.Constant(int_type, 0), seek_end])
+        size = self.builder.call(self.ftell, [handle])
+        self.builder.call(self.fseek, [handle, ir.Constant(int_type, 0), seek_set])
+        # Allocate size+1 bytes from arena for null terminator
+        one   = ir.Constant(int_type, 1)
+        alloc_size = self.builder.add(size, one)
+        buf   = self.builder.call(self.malloc, [alloc_size])
+        # fread(buf, 1, size, handle)
+        self.builder.call(self.fread, [buf, one, size, handle])
+        # Null-terminate: buf[size] = 0
+        end_ptr = self.builder.gep(buf, [size])
+        self.builder.store(ir.Constant(ir.IntType(8), 0), end_ptr)
+        return buf
+
+    def gen_write_file(self, node):
+        """write_file(handle, text) — writes string to file."""
+        if len(node.args) != 2:
+            raise Exception("write_file(handle, text) expects 2 arguments")
+        handle = self.gen_expr(node.args[0])
+        text   = self.gen_expr(node.args[1])
+        length = self.builder.call(self.strlen, [text])
+        one    = ir.Constant(int_type, 1)
+        self.builder.call(self.fwrite, [text, one, length, handle])
+        return ir.Constant(int_type, 0)
+
+    def gen_close_file(self, node):
+        """close_file(handle) — closes the file."""
+        if len(node.args) != 1:
+            raise Exception("close_file(handle) expects 1 argument")
+        handle = self.gen_expr(node.args[0])
+        self.builder.call(self.fclose, [handle])
+        return ir.Constant(int_type, 0)
 
     def gen_arena_alloc(self, node):
         if len(node.args) != 1:
@@ -387,6 +596,29 @@ class Codegen:
         self.builder.branch(check_block)
         self.builder.position_at_end(end_block)
 
+    def _collect_global_constants(self, main_statements):
+        """Pre-pass: evaluate module-level let x be <literal number> statements
+        into LLVM global variables so functions can access them.
+        Only handles NumberNode and FloatNode literals — complex expressions
+        are skipped and resolved at runtime in main instead."""
+        for node in main_statements:
+            if not isinstance(node, LetNode):
+                continue
+            if isinstance(node.value, NumberNode):
+                val = ir.Constant(int_type, int(node.value.value))
+                g = ir.GlobalVariable(self.module, int_type, name=f"gconst_{node.name}")
+                g.linkage = "internal"
+                g.initializer = val
+                g.global_constant = True
+                self.global_vars[node.name] = g
+            elif isinstance(node.value, FloatNode):
+                val = ir.Constant(float_type, float(node.value.value))
+                g = ir.GlobalVariable(self.module, float_type, name=f"gconst_{node.name}")
+                g.linkage = "internal"
+                g.initializer = val
+                g.global_constant = True
+                self.global_vars[node.name] = g
+
     # ------------------------------------------------------------------
     # generate / gen_function
     # ------------------------------------------------------------------
@@ -398,6 +630,10 @@ class Codegen:
 
         for thing in thing_nodes:
             self.gen_thing(thing)
+
+        # Pre-pass: collect module-level constant LetNodes into global LLVM variables
+        # so they are visible inside functions compiled before main runs
+        self._collect_global_constants(main_statements)
 
         fn_param_types = {}
         for fn in fun_nodes:
@@ -424,10 +660,13 @@ class Codegen:
         block     = main_func.append_basic_block(name="entry")
         self.builder = ir.IRBuilder(block)
         self.vars = {}
+        self.in_main = True
 
         self.gen_arena_init()
 
         for stmt in main_statements:
+            if self.builder.block.is_terminated:
+                break
             self.gen_statement(stmt)
 
         if not self.builder.block.is_terminated:
@@ -440,7 +679,8 @@ class Codegen:
         ir_func = self.functions[fn.name]
         block   = ir_func.append_basic_block(name="entry")
         self.builder = ir.IRBuilder(block)
-        self.vars = {}
+        self.vars = dict(self.global_vars)
+        self.in_main = False
         self.current_return_type = ir_func.function_type.return_type
 
         for i, param_name in enumerate(fn.params):
@@ -451,6 +691,8 @@ class Codegen:
             self.vars[param_name] = ptr
 
         for stmt in fn.body:
+            if self.builder.block.is_terminated:
+                break
             self.gen_statement(stmt)
 
         if not self.builder.block.is_terminated:
@@ -507,6 +749,9 @@ class Codegen:
             return type_env.get(node.name, int_type)
         elif isinstance(node, UnaryOpNode):
             return self.infer_expr_type(node.operand, type_env, fn_return_types)
+        elif isinstance(node, (AndNode, OrNode)):
+            return int_type
+
         elif isinstance(node, BinaryOpNode):
             left  = self.infer_expr_type(node.left, type_env, fn_return_types)
             right = self.infer_expr_type(node.right, type_env, fn_return_types)
@@ -527,7 +772,12 @@ class Codegen:
             if node.name in ("mat4", "mat4_identity", "mat4_translate", "mat4_scale",
                              "mat4_rotate_x", "mat4_rotate_y", "mat4_rotate_z"):
                 return MAT4_TYPE
+            if node.name in ("make_str", "str_concat", "read_file", "open_file",
+                             "open_file_write"):
+                return STRING_TYPE
             return fn_return_types.get(node.name, int_type)
+        elif isinstance(node, StringNode):
+            return STRING_TYPE
         else:
             return int_type
 
@@ -542,6 +792,8 @@ class Codegen:
             ptr = self.alloca(value.type, name=node.name)
             self.builder.store(value, ptr)
             self.vars[node.name] = ptr
+            if self.in_main:
+                self.global_vars[node.name] = ptr
             if self._pending_array_elem_type is not None:
                 self.var_array_elem_types[node.name] = self._pending_array_elem_type
                 self._pending_array_elem_type = None
@@ -587,6 +839,11 @@ class Codegen:
             value = self.gen_expr(node.value)
             value = self.coerce_to(value, self.current_return_type)
             self.builder.ret(value)
+
+        elif isinstance(node, FailNode):
+            msg = f"skill issue at line {node.line}: {node.message}\n"
+            self.print_text(msg, f"str_fail_{node.line}")
+            self.builder.ret(ir.Constant(ir.IntType(32), 1))
 
         elif isinstance(node, CallNode):
             self.gen_expr(node)
@@ -786,7 +1043,23 @@ class Codegen:
             return left, self.builder.sitofp(right, float_type), True
         raise Exception(f"Cannot combine incompatible types {left.type} and {right.type}")
 
+    def gen_expr_bool(self, node):
+        """Evaluate a condition node (AndNode/OrNode/CompareNode) as i1."""
+        if isinstance(node, AndNode):
+            return self.builder.and_(self.gen_expr_bool(node.left), self.gen_expr_bool(node.right))
+        if isinstance(node, OrNode):
+            return self.builder.or_(self.gen_expr_bool(node.left), self.gen_expr_bool(node.right))
+        return self.gen_compare(node)
+
     def gen_compare(self, node):
+        if isinstance(node, AndNode):
+            left  = self.gen_compare(node.left)
+            right = self.gen_compare(node.right)
+            return self.builder.and_(left, right)
+        if isinstance(node, OrNode):
+            left  = self.gen_compare(node.left)
+            right = self.gen_compare(node.right)
+            return self.builder.or_(left, right)
         left  = self.gen_expr(node.left)
         right = self.gen_expr(node.right)
         if left.type == STRING_TYPE or right.type == STRING_TYPE:
@@ -845,6 +1118,10 @@ class Codegen:
             else:
                 raise Exception(f"Unknown unary operator: {node.op}")
 
+        elif isinstance(node, (AndNode, OrNode, CompareNode)):
+            result = self.gen_expr_bool(node)
+            return self.builder.zext(result, int_type)
+
         elif isinstance(node, BinaryOpNode):
             left  = self.gen_expr(node.left)
             right = self.gen_expr(node.right)
@@ -885,6 +1162,30 @@ class Codegen:
                 return self.gen_mat4_rotate_y(node)
             if node.name == "mat4_rotate_z":
                 return self.gen_mat4_rotate_z(node)
+            if node.name == "char_at":
+                return self.gen_char_at(node)
+            if node.name == "str_len":
+                return self.gen_str_len(node)
+            if node.name == "char_code":
+                return self.gen_char_code(node)
+            if node.name == "make_str":
+                return self.gen_make_str(node)
+            if node.name == "str_append_char":
+                return self.gen_str_append_char(node)
+            if node.name == "str_eq":
+                return self.gen_str_eq(node)
+            if node.name == "str_concat":
+                return self.gen_str_concat(node)
+            if node.name == "open_file":
+                return self.gen_open_file(node)
+            if node.name == "open_file_write":
+                return self.gen_open_file_write(node)
+            if node.name == "read_file":
+                return self.gen_read_file(node)
+            if node.name == "write_file":
+                return self.gen_write_file(node)
+            if node.name == "close_file":
+                return self.gen_close_file(node)
             if node.name == "arena_alloc":
                 return self.gen_arena_alloc(node)
             if node.name == "arena_reset":

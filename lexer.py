@@ -91,6 +91,10 @@ class Lexer:
         "back"      : TokenType.BACK,
         "is"        : TokenType.IS,
         "not"       : TokenType.NOT,
+        "and"       : TokenType.AND,
+        "or"        : TokenType.OR,
+        "skill"     : TokenType.SKILL,
+        "issue"     : TokenType.ISSUE,
         "true"      : TokenType.BOOL,
         "false"     : TokenType.BOOL,
     }

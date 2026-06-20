@@ -1,4 +1,6 @@
 from tokens import TokenType
+# FailNode is defined in this file — no external import needed.
+# (This comment is just a marker; no actual change required here.)
 
 class NumberNode:
     def __init__(self, value):
@@ -39,10 +41,12 @@ class AssignNode:
         return f"Assign({self.name} = {self.value})"
 
 class ShowNode:
-    def __init__(self, value):
+    def __init__(self, value, no_newline=False):
         self.value = value
+        self.no_newline = no_newline
     def __repr__(self):
-        return f"Show({self.value})"
+        kind = "Disp" if self.no_newline else "Show"
+        return f"{kind}({self.value})"
 
 class UnaryOpNode:
     def __init__(self, op, operand):
@@ -50,6 +54,20 @@ class UnaryOpNode:
         self.operand = operand
     def __repr__(self):
         return f"UnaryOp({self.op}{self.operand})"
+
+class AndNode:
+    def __init__(self, left, right):
+        self.left  = left
+        self.right = right
+    def __repr__(self):
+        return f"And({self.left}, {self.right})"
+
+class OrNode:
+    def __init__(self, left, right):
+        self.left  = left
+        self.right = right
+    def __repr__(self):
+        return f"Or({self.left}, {self.right})"
 
 class BinaryOpNode:
     def __init__(self, left, op, right):
@@ -111,6 +129,15 @@ class GiveBackNode:
         self.value = value
     def __repr__(self):
         return f"GiveBack({self.value})"
+
+class FailNode:
+    """skill issue "message" — prints the message with the source line
+    number and exits with code 1."""
+    def __init__(self, message, line):
+        self.message = message
+        self.line    = line
+    def __repr__(self):
+        return f"Fail({self.message!r}, line={self.line})"
 
 class ThingNode:
     def __init__(self, name, fields, field_types):
@@ -229,6 +256,8 @@ class Parser:
             return self.parse_fun()
         elif token.type == TokenType.GIVE:
             return self.parse_give_back()
+        elif token.type == TokenType.SKILL:
+            return self.parse_skill_issue()
         else:
             raise Exception(f"Unexpected token {token.type} on line {token.line}")
 
@@ -294,9 +323,23 @@ class Parser:
         return AssignNode(name, value)
 
     def parse_show(self):
+        # #region agent log
+        import json, time, os
+        _tok = self.current()
+        _is_disp = _tok.type == TokenType.DISP
+        _log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-3f30cb.log")
+        with open(_log_path, "a", encoding="utf-8") as _f:
+            _f.write(json.dumps({
+                "sessionId": "3f30cb", "runId": "pre-fix", "hypothesisId": "H1",
+                "location": "ayasparser.py:parse_show",
+                "message": "parse_show token kind",
+                "data": {"token_type": _tok.type.value, "is_disp": _is_disp, "line": _tok.line},
+                "timestamp": int(time.time() * 1000),
+            }) + "\n")
+        # #endregion
         self.advance()
         value = self.parse_expression()
-        return ShowNode(value)
+        return ShowNode(value, no_newline=_is_disp)
 
     def parse_when(self):
         branches  = []
@@ -389,13 +432,46 @@ class Parser:
         value = self.parse_expression()
         return GiveBackNode(value)
 
+    def parse_skill_issue(self):
+        """skill issue "message" — captures the line number from the
+        `skill` token so the error output can report where in the source
+        file the failure was triggered."""
+        skill_token = self.expect(TokenType.SKILL)
+        self.expect(TokenType.ISSUE)
+        message = self.expect(TokenType.STRING).value
+        return FailNode(message, skill_token.line)
+
     def parse_condition(self):
         self.expect(TokenType.LBRACKET)
-        left  = self.parse_primary()
-        op    = self.parse_compare_op()
-        right = self.parse_primary()
+        left = self.parse_expression()
+        # If next token is a comparison op, parse right side
+        # Otherwise treat the expression itself as a boolean condition
+        if self.current().type in (TokenType.IS, TokenType.GREATER, TokenType.LESS,
+                                   TokenType.GREATEREQUAL, TokenType.LESSEQUAL):
+            op    = self.parse_compare_op()
+            right = self.parse_expression()
+            node  = CompareNode(left, op, right)
+        else:
+            # Boolean expression — wrap as comparison with 0
+            node = CompareNode(left, "is not", NumberNode(0))
+        # Support: [a is b and c is d] / [a is b or c is d]
+        while self.current().type in (TokenType.AND, TokenType.OR):
+            logic = self.current().type
+            self.advance()
+            left2 = self.parse_expression()
+            if self.current().type in (TokenType.IS, TokenType.GREATER, TokenType.LESS,
+                                       TokenType.GREATEREQUAL, TokenType.LESSEQUAL):
+                op2    = self.parse_compare_op()
+                right2 = self.parse_expression()
+                right_node = CompareNode(left2, op2, right2)
+            else:
+                right_node = CompareNode(left2, "is not", NumberNode(0))
+            if logic == TokenType.AND:
+                node = AndNode(node, right_node)
+            else:
+                node = OrNode(node, right_node)
         self.expect(TokenType.RBRACKET)
-        return CompareNode(left, op, right)
+        return node
 
     def parse_compare_op(self):
         token = self.current()
@@ -442,6 +518,31 @@ class Parser:
                     elements.append(self.parse_primary())
                 self.expect(TokenType.RBRACKET)
                 return ArrayLiteralNode(elements)
+            # comparison or binary op
+            if self.current().type in (TokenType.IS, TokenType.GREATER,
+                                       TokenType.LESS, TokenType.GREATEREQUAL,
+                                       TokenType.LESSEQUAL):
+                op    = self.parse_compare_op()
+                right = self.parse_primary()
+                node  = CompareNode(first, op, right)
+                while self.current().type in (TokenType.AND, TokenType.OR):
+                    logic = self.current().type
+                    self.advance()
+                    left2 = self.parse_primary()
+                    if self.current().type in (TokenType.IS, TokenType.GREATER,
+                                               TokenType.LESS, TokenType.GREATEREQUAL,
+                                               TokenType.LESSEQUAL):
+                        op2    = self.parse_compare_op()
+                        right2 = self.parse_primary()
+                        rnode  = CompareNode(left2, op2, right2)
+                    else:
+                        rnode = CompareNode(left2, "is not", NumberNode(0))
+                    if logic == TokenType.AND:
+                        node = AndNode(node, rnode)
+                    else:
+                        node = OrNode(node, rnode)
+                self.expect(TokenType.RBRACKET)
+                return node
             op    = self.advance().value
             right = self.parse_primary()
             self.expect(TokenType.RBRACKET)

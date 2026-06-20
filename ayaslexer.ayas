@@ -1,0 +1,317 @@
+// Ayas self-hosted lexer
+// Reads testinput.ayas, prints one token per line: TYPE value line
+// Matches Python lexer output exactly.
+
+let source be read_file(open_file("testinput.ayas"))
+let length be str_len(source)
+let pos be 0
+let line be 1
+
+// ASCII constants
+let CH_NEWLINE  be 10
+let CH_SPACE    be 32
+let CH_TAB      be 9
+let CH_CR       be 13
+let CH_0        be 48
+let CH_9        be 57
+let CH_a        be 97
+let CH_z        be 122
+let CH_A        be 65
+let CH_Z        be 90
+let CH_UNDER    be 95
+let CH_QUOTE    be 34
+let CH_SLASH    be 47
+let CH_PLUS     be 43
+let CH_MINUS    be 45
+let CH_STAR     be 42
+let CH_LBRACKET be 91
+let CH_RBRACKET be 93
+let CH_LBRACE   be 123
+let CH_RBRACE   be 125
+let CH_LPAREN   be 40
+let CH_RPAREN   be 41
+let CH_COMMA    be 44
+let CH_COLON    be 58
+let CH_DOT      be 46
+let CH_GT       be 62
+let CH_LT       be 60
+let CH_EQ       be 61
+
+fun is_digit(c: number) {
+    give back [c >= 48 and c <= 57]
+}
+
+fun is_alpha(c: number) {
+    when [c >= 97 and c <= 122] {
+        give back 1
+    }
+    when [c >= 65 and c <= 90] {
+        give back 1
+    }
+    when [c is 95] {
+        give back 1
+    }
+    give back 0
+}
+
+fun is_alnum(c: number) {
+    when [c >= 97 and c <= 122] {
+        give back 1
+    }
+    when [c >= 65 and c <= 90] {
+        give back 1
+    }
+    when [c >= 48 and c <= 57] {
+        give back 1
+    }
+    when [c is 95] {
+        give back 1
+    }
+    give back 0
+}
+
+fun int_to_str(n: number) {
+    let buf be make_str(32)
+    let tmp be make_str(32)
+    let i be n
+    let tdone be 0
+    when [n is 0] {
+        str_append_char(buf, 48)
+        tdone be 1
+    }
+    repeat tloop in [0 to 20] {
+        when [tdone is 0] {
+            when [i <= 0] {
+                tdone be 1
+            } otherwise {
+                let d be [i / 10]
+                let d be [d * 10]
+                let d be [i - d]
+                let d be [d + 48]
+                str_append_char(tmp, d)
+                i be [i / 10]
+            }
+        }
+    }
+    let tlen be str_len(tmp)
+    let ti be [tlen - 1]
+    let rdone be 0
+    repeat rloop in [0 to 20] {
+        when [rdone is 0] {
+            when [ti < 0] {
+                rdone be 1
+            } otherwise {
+                str_append_char(buf, char_at(tmp, ti))
+                ti be [ti - 1]
+            }
+        }
+    }
+    give back buf
+}
+
+repeat outer in [0 to length] {
+    when [pos >= length] {
+        // idle
+
+    } otherwise {
+        let c be char_at(source, pos)
+
+        when [c is 32 or c is 9 or c is 13] {
+            pos be [pos + 1]
+
+        } rather when [c is 10] {
+            show str_concat("NEWLINE \\n ", int_to_str(line))
+            line be [line + 1]
+            pos be [pos + 1]
+
+        } rather when [c is 47] {
+            when [[pos + 1] < length and char_at(source, [pos + 1]) is 47] {
+                pos be [pos + 2]
+                let cdone be 0
+                repeat cskip in [0 to length] {
+                    when [cdone is 0] {
+                        when [pos >= length] {
+                            cdone be 1
+                        } rather when [char_at(source, pos) is 10] {
+                            cdone be 1
+                        } otherwise {
+                            pos be [pos + 1]
+                        }
+                    }
+                }
+            } otherwise {
+                show str_concat("/ / ", int_to_str(line))
+                pos be [pos + 1]
+            }
+
+        } rather when [c is 62] {
+            when [[pos + 1] < length and char_at(source, [pos + 1]) is 61] {
+                show str_concat(">= >= ", int_to_str(line))
+                pos be [pos + 2]
+            } otherwise {
+                show str_concat("> > ", int_to_str(line))
+                pos be [pos + 1]
+            }
+
+        } rather when [c is 60] {
+            when [[pos + 1] < length and char_at(source, [pos + 1]) is 61] {
+                show str_concat("<= <= ", int_to_str(line))
+                pos be [pos + 2]
+            } otherwise {
+                show str_concat("< < ", int_to_str(line))
+                pos be [pos + 1]
+            }
+
+        } rather when [c is 34] {
+            pos be [pos + 1]
+            let sbuf be make_str(512)
+            let sdone be 0
+            repeat sloop in [0 to length] {
+                when [sdone is 0] {
+                    when [pos >= length] {
+                        skill issue "unterminated string literal"
+                    } rather when [char_at(source, pos) is 34] {
+                        pos be [pos + 1]
+                        sdone be 1
+                    } otherwise {
+                        str_append_char(sbuf, char_at(source, pos))
+                        pos be [pos + 1]
+                    }
+                }
+            }
+            show str_concat(str_concat(str_concat("STRING ", sbuf), " "), int_to_str(line))
+
+        } rather when [is_digit(c)] {
+            let nbuf be make_str(64)
+            let is_f be 0
+            let ndone be 0
+            repeat nloop in [0 to length] {
+                when [ndone is 0] {
+                    when [pos >= length] {
+                        ndone be 1
+                    } rather when [is_digit(char_at(source, pos))] {
+                        str_append_char(nbuf, char_at(source, pos))
+                        pos be [pos + 1]
+                    } rather when [char_at(source, pos) is 46 and [pos + 1] < length and is_digit(char_at(source, [pos + 1]))] {
+                        is_f be 1
+                        str_append_char(nbuf, 46)
+                        pos be [pos + 1]
+                    } otherwise {
+                        ndone be 1
+                    }
+                }
+            }
+            when [is_f is 1] {
+                show str_concat(str_concat(str_concat("FLOAT ", nbuf), " "), int_to_str(line))
+            } otherwise {
+                show str_concat(str_concat(str_concat("NUMBER ", nbuf), " "), int_to_str(line))
+            }
+
+        } rather when [is_alpha(c)] {
+            let wbuf be make_str(128)
+            let wdone be 0
+            repeat wloop in [0 to length] {
+                when [wdone is 0] {
+                    when [pos >= length] {
+                        wdone be 1
+                    } rather when [is_alnum(char_at(source, pos))] {
+                        str_append_char(wbuf, char_at(source, pos))
+                        pos be [pos + 1]
+                    } otherwise {
+                        wdone be 1
+                    }
+                }
+            }
+            when [str_eq(wbuf, "let")] {
+                show str_concat("let let ", int_to_str(line))
+            } rather when [str_eq(wbuf, "be")] {
+                show str_concat("be be ", int_to_str(line))
+            } rather when [str_eq(wbuf, "fun")] {
+                show str_concat("fun fun ", int_to_str(line))
+            } rather when [str_eq(wbuf, "thing")] {
+                show str_concat("thing thing ", int_to_str(line))
+            } rather when [str_eq(wbuf, "when")] {
+                show str_concat("when when ", int_to_str(line))
+            } rather when [str_eq(wbuf, "rather")] {
+                show str_concat("rather rather ", int_to_str(line))
+            } rather when [str_eq(wbuf, "otherwise")] {
+                show str_concat("otherwise otherwise ", int_to_str(line))
+            } rather when [str_eq(wbuf, "repeat")] {
+                show str_concat("repeat repeat ", int_to_str(line))
+            } rather when [str_eq(wbuf, "in")] {
+                show str_concat("in in ", int_to_str(line))
+            } rather when [str_eq(wbuf, "to")] {
+                show str_concat("to to ", int_to_str(line))
+            } rather when [str_eq(wbuf, "times")] {
+                show str_concat("times times ", int_to_str(line))
+            } rather when [str_eq(wbuf, "show")] {
+                show str_concat("show show ", int_to_str(line))
+            } rather when [str_eq(wbuf, "disp")] {
+                show str_concat("disp disp ", int_to_str(line))
+            } rather when [str_eq(wbuf, "give")] {
+                show str_concat("give give ", int_to_str(line))
+            } rather when [str_eq(wbuf, "back")] {
+                show str_concat("back back ", int_to_str(line))
+            } rather when [str_eq(wbuf, "is")] {
+                show str_concat("is is ", int_to_str(line))
+            } rather when [str_eq(wbuf, "not")] {
+                show str_concat("not not ", int_to_str(line))
+            } rather when [str_eq(wbuf, "and")] {
+                show str_concat("and and ", int_to_str(line))
+            } rather when [str_eq(wbuf, "or")] {
+                show str_concat("or or ", int_to_str(line))
+            } rather when [str_eq(wbuf, "skill")] {
+                show str_concat("skill skill ", int_to_str(line))
+            } rather when [str_eq(wbuf, "issue")] {
+                show str_concat("issue issue ", int_to_str(line))
+            } rather when [str_eq(wbuf, "true")] {
+                show str_concat("BOOL true ", int_to_str(line))
+            } rather when [str_eq(wbuf, "false")] {
+                show str_concat("BOOL false ", int_to_str(line))
+            } otherwise {
+                show str_concat(str_concat(str_concat("IDENTIFIER ", wbuf), " "), int_to_str(line))
+            }
+
+        } rather when [c is 43] {
+            show str_concat("+ + ", int_to_str(line))
+            pos be [pos + 1]
+        } rather when [c is 45] {
+            show str_concat("- - ", int_to_str(line))
+            pos be [pos + 1]
+        } rather when [c is 42] {
+            show str_concat("* * ", int_to_str(line))
+            pos be [pos + 1]
+        } rather when [c is 91] {
+            show str_concat("[ [ ", int_to_str(line))
+            pos be [pos + 1]
+        } rather when [c is 93] {
+            show str_concat("] ] ", int_to_str(line))
+            pos be [pos + 1]
+        } rather when [c is 123] {
+            show str_concat("{ { ", int_to_str(line))
+            pos be [pos + 1]
+        } rather when [c is 125] {
+            show str_concat("} } ", int_to_str(line))
+            pos be [pos + 1]
+        } rather when [c is 40] {
+            show str_concat("( ( ", int_to_str(line))
+            pos be [pos + 1]
+        } rather when [c is 41] {
+            show str_concat(") ) ", int_to_str(line))
+            pos be [pos + 1]
+        } rather when [c is 44] {
+            show str_concat(", , ", int_to_str(line))
+            pos be [pos + 1]
+        } rather when [c is 58] {
+            show str_concat(": : ", int_to_str(line))
+            pos be [pos + 1]
+        } rather when [c is 46] {
+            show str_concat(". . ", int_to_str(line))
+            pos be [pos + 1]
+        } otherwise {
+            pos be [pos + 1]
+        }
+    }
+}
+
+show str_concat("EOF ", int_to_str(line))
